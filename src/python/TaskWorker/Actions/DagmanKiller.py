@@ -75,7 +75,7 @@ class DagmanKiller(TaskAction):
             hostname = ''
 
         if not self.killAllFlag:
-            const = "CRAB_ReqName =?= %s && member(CRAB_Id, %s) && member(CRAB_ParentId, %s)" % (HTCondorUtils.quote(self.workflow), ad.lookup("foo").__repr__(), ad.lookup("foo").__repr__())
+            const = "CRAB_ReqName =?= %s && member(CRAB_Id, %s) || member(CRAB_ParentId, %s)" % (HTCondorUtils.quote(self.workflow), ad.lookup("foo").__repr__(), ad.lookup("foo").__repr__())
         else:
             const = 'CRAB_ReqName =?= %s && TaskType=?="Job"' % HTCondorUtils.quote(self.workflow)
         try:
