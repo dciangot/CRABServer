@@ -57,41 +57,24 @@ about the file to the FJR. The information is:
 
 The PostJob and cmscp are the only places in CRAB3 where we should use camel_case instead of snakeCase.
 """
+
 from __future__ import print_function
 
-import os
-import sys
 import time
-import json
-import uuid
-import glob
-import fcntl
 import errno
 import pickle
-import pprint
 import shutil
-import signal
 import tarfile
-import hashlib
 import logging
-import commands
-import unittest
-import datetime
-import tempfile
-import traceback
 import subprocess
 import logging.handlers
-from shutil import move
 from httplib import HTTPException
 
 import DashboardAPI
-import WMCore.Database.CMSCouch as CMSCouch
 from WMCore.DataStructs.LumiList import LumiList
 from WMCore.Services.WMArchive.DataMap import createArchiverDoc
 
-from ast import literal_eval
 from TaskWorker import __version__
-from ServerUtilities import getLock
 from RESTInteractions import HTTPRequests ## Why not to use from WMCore.Services.Requests import Requests
 from TaskWorker.Actions.Splitter import Splitter
 from TaskWorker.Actions.RetryJob import RetryJob
@@ -99,10 +82,11 @@ from TaskWorker.Actions.RetryJob import JOB_RETURN_CODES
 from TaskWorker.Actions.DagmanCreator import DagmanCreator
 from TaskWorker.WorkerExceptions import TaskWorkerException
 
-from ServerUtilities import isFailurePermanent, parseJobAd, mostCommon, TRANSFERDB_STATES, PUBLICATIONDB_STATES, encodeRequest, isCouchDBURL, oracleOutputMapping
+from ServerUtilities import isFailurePermanent, parseJobAd, mostCommon, encodeRequest
 
 from WMCore.Configuration import Configuration, ConfigSection
-
+from PostJobActions.ASOServerJob import ASOServerJob
+from PostJobActions.PostJobUtils import *
 
 ASO_JOB = None
 G_JOB_REPORT_NAME = None
@@ -112,1068 +96,8 @@ G_WMARCHIVE_REPORT_NAME_NEW = None
 G_ERROR_SUMMARY_FILE_NAME = "error_summary.json"
 G_FJR_PARSE_RESULTS_FILE_NAME = "task_process/fjr_parse_results.txt"
 
-def sighandler(*args):
-    if ASO_JOB:
-        ASO_JOB.cancel()
 
-signal.signal(signal.SIGHUP, sighandler)
-signal.signal(signal.SIGINT, sighandler)
-signal.signal(signal.SIGTERM, sighandler)
-
-##==============================================================================
-
-
-class NotFound(Exception):
-    """Not Found is raised only if there is no document found in RDBMS.
-       This makes PostJob to submit new transfer request to database."""
-    pass
-
-DEFER_NUM = -1
-
-def first_pj_execution():
-    return DEFER_NUM == 0
-
-##==============================================================================
-
-def prepareErrorSummary(logger, fsummary, job_id, crab_retry):
-    """Parse the job_fjr file corresponding to the current PostJob. If an error
-       message is found, it is inserted into the error_summary.json file
-    """
-
-    ## The job_id and crab_retry variables in PostJob are integers, while here we
-    ## mostly use them as strings.
-    job_id = str(job_id)
-    crab_retry = str(crab_retry)
-
-    error_summary = []
-    error_summary_changed = False
-    fjr_file_name = "job_fjr." + job_id + "." + crab_retry + ".json"
-
-    with open(fjr_file_name) as frep:
-        try:
-            rep = None
-            exit_code = -1
-            rep = json.load(frep)
-            if not 'exitCode' in rep:
-                raise Exception("'exitCode' key not found in the report")
-            exit_code = rep['exitCode']
-            if not 'exitMsg'  in rep:
-                raise Exception("'exitMsg' key not found in the report")
-            exit_msg = rep['exitMsg']
-            if not 'steps'    in rep:
-                raise Exception("'steps' key not found in the report")
-            if not 'cmsRun'   in rep['steps']:
-                raise Exception("'cmsRun' key not found in report['steps']")
-            if not 'errors'   in rep['steps']['cmsRun']:
-                raise Exception("'errors' key not found in report['steps']['cmsRun']")
-            if rep['steps']['cmsRun']['errors']:
-                ## If there are errors in the job report, they come from the job execution. This
-                ## is the error we want to report to the user, so write it to the error summary.
-                if len(rep['steps']['cmsRun']['errors']) != 1:
-                    #this should never happen because the report has just one step, but just in case print a message
-                    logger.info("More than one error found in report['steps']['cmsRun']['errors']. Just considering the first one.")
-                msg  = "Updating error summary for jobid %s retry %s with following information:" % (job_id, crab_retry)
-                msg += "\n'exit code' = %s" % (exit_code)
-                msg += "\n'exit message' = %s" % (exit_msg)
-                msg += "\n'error message' = %s" % (rep['steps']['cmsRun']['errors'][0])
-                logger.info(msg)
-                error_summary = [exit_code, exit_msg, rep['steps']['cmsRun']['errors'][0]]
-                error_summary_changed = True
-            else:
-                ## If there are no errors in the job report, but there is an exit code and exit
-                ## message from the job (not post-job), we want to report them to the user only
-                ## in case we know this is the terminal exit code and exit message. And this is
-                ## the case if the exit code is not 0. Even a post-job exit code != 0 can be
-                ## added later to the job report, the job exit code takes precedence, so we can
-                ## already write it to the error summary.
-                if exit_code != 0:
-                    msg  = "Updating error summary for jobid %s retry %s with following information:" % (job_id, crab_retry)
-                    msg += "\n'exit code' = %s" % (exit_code)
-                    msg += "\n'exit message' = %s" % (exit_msg)
-                    logger.info(msg)
-                    error_summary = [exit_code, exit_msg, {}]
-                    error_summary_changed = True
-                else:
-                    ## In case the job exit code is 0, we still have to check if there is an exit
-                    ## code from post-job. If there is a post-job exit code != 0, write it to the
-                    ## error summary; otherwise write the exit code 0 and exit message from the job
-                    ## (the message should be "OK").
-                    postjob_exit_code = rep.get('postjob', {}).get('exitCode', -1)
-                    postjob_exit_msg  = rep.get('postjob', {}).get('exitMsg', "No post-job error message available.")
-                    if postjob_exit_code != 0:
-                        ## Use exit code 90000 as a general exit code for failures in the post-processing step.
-                        ## The 'crab status' error summary should not show this error code,
-                        ## but replace it with the generic message "failed in post-processing".
-                        msg  = "Updating error summary for jobid %s retry %s with following information:" % (job_id, crab_retry)
-                        msg += "\n'exit code' = 90000 ('Post-processing failed')"
-                        msg += "\n'exit message' = %s" % (postjob_exit_msg)
-                        logger.info(msg)
-                        error_summary = [90000, postjob_exit_msg, {}]
-                    else:
-                        msg  = "Updating error summary for jobid %s retry %s with following information:" % (job_id, crab_retry)
-                        msg += "\n'exit code' = %s" % (exit_code)
-                        msg += "\n'exit message' = %s" % (exit_msg)
-                        logger.info(msg)
-                        error_summary = [exit_code, exit_msg, {}]
-                    error_summary_changed = True
-        except Exception as ex:
-            logger.info(str(ex))
-            ## Write to the error summary that the job report is not valid or has no error
-            ## message
-            if not rep:
-                exit_msg = 'Invalid framework job report. The framework job report exists, but it cannot be loaded.'
-            else:
-                exit_msg = rep['exitMsg'] if 'exitMsg' in rep else 'The framework job report could be loaded, but no error message was found there.'
-            msg  = "Updating error summary for jobid %s retry %s with following information:" % (job_id, crab_retry)
-            msg += "\n'exit code' = %s" % (exit_code)
-            msg += "\n'exit message' = %s" % (exit_msg)
-            logger.info(msg)
-            error_summary = [exit_code, exit_msg, {}]
-            error_summary_changed = True
-
-    # Write the fjr report summary of this postjob to a file which task_process reads incrementally
-    if error_summary_changed and os.path.isfile("/etc/enable_task_daemon"):
-        with getLock(G_FJR_PARSE_RESULTS_FILE_NAME):
-            with open(G_FJR_PARSE_RESULTS_FILE_NAME, "a+") as fjr_parse_results:
-                fjr_parse_results.write(json.dumps({job_id : {crab_retry : error_summary}}) + "\n")
-
-    # Read, update and re-write the error_summary.json file
-    try:
-        error_summary_old_content = {}
-        if os.stat(G_ERROR_SUMMARY_FILE_NAME).st_size != 0:
-            fsummary.seek(0)
-            error_summary_old_content = json.load(fsummary)
-    except (IOError, ValueError):
-        ## There is nothing to do if the error_summary file doesn't exist or is invalid.
-        ## Just recreate it.
-        logger.info("File %s is empty, wrong or does not exist. Will create a new file." % (G_ERROR_SUMMARY_FILE_NAME))
-    error_summary_new_content = error_summary_old_content
-    error_summary_new_content[job_id] = {crab_retry : error_summary}
-
-    ## If we have updated the error summary, write it to the json file.
-    ## Use a temporary file and rename to avoid concurrent writing of the file.
-    if error_summary_changed:
-        logger.debug("Writing error summary file")
-        tempFilename = (G_ERROR_SUMMARY_FILE_NAME + ".%s") % os.getpid()
-        with open(tempFilename, "w") as tempFile:
-            json.dump(error_summary_new_content, tempFile)
-        move(tempFilename, G_ERROR_SUMMARY_FILE_NAME)
-        logger.debug("Written error summary file")
-
-##==============================================================================
-
-class ASOServerJob(object):
-    """
-    Class used to inject transfer requests to ASO database.
-    """
-    def __init__(self, logger, aso_start_time, aso_start_timestamp, dest_site, source_dir,
-                 dest_dir, source_sites, job_id, filenames, reqname, log_size,
-                 log_needs_transfer, job_report_output, job_ad, crab_retry, retry_timeout, \
-                 job_failed, transfer_logs, transfer_outputs, rest_host, rest_uri_no_api):
-        """
-        ASOServerJob constructor.
-        """
-        self.logger = logger
-        self.docs_in_transfer = None
-        self.crab_retry = crab_retry
-        self.retry_timeout = retry_timeout
-        self.couch_server = None
-        self.couch_database = None
-        self.job_id = job_id
-        self.dest_site = dest_site
-        self.source_dir = source_dir
-        self.dest_dir = dest_dir
-        self.job_failed = job_failed
-        self.source_sites = source_sites
-        self.filenames = filenames
-        self.reqname = reqname
-        self.job_report_output = job_report_output
-        self.log_size = log_size
-        self.log_needs_transfer = log_needs_transfer
-        self.transfer_logs = transfer_logs
-        self.transfer_outputs = transfer_outputs
-        self.job_ad = job_ad
-        self.failures = {}
-        self.aso_start_time = aso_start_time
-        self.aso_start_timestamp = aso_start_timestamp
-        proxy = os.environ.get('X509_USER_PROXY', None)
-        self.aso_db_url = self.job_ad['CRAB_ASOURL']
-        self.rest_host = rest_host
-        self.rest_uri_no_api = rest_uri_no_api
-        self.rest_uri_file_user_transfers = rest_uri_no_api + "/fileusertransfers"
-        self.rest_uri_file_transfers = rest_uri_no_api + "/filetransfers"
-        self.found_doc_in_db = False
-        #I don't think it is necessary to default to asynctransfer here, we are taking care of it
-        #in dagman creator and if CRAB_ASODB is not there it means it's old task executing old code
-        #But just to make sure...
-        self.aso_db_name = self.job_ad.get('CRAB_ASODB', 'asynctransfer') or 'asynctransfer'
-        try:
-            if first_pj_execution():
-                self.logger.info("Will use ASO server at %s." % (self.aso_db_url))
-            if isCouchDBURL(self.aso_db_url):
-                self.couch_server = CMSCouch.CouchServer(dburl = self.aso_db_url, ckey = proxy, cert = proxy)
-                self.couch_database = self.couch_server.connectDatabase(self.aso_db_name, create = False)
-            else:
-                self.server = HTTPRequests(self.rest_host, proxy, proxy, retry=2)
-        except Exception as ex:
-            msg = "Failed to connect to ASO database: %s" % (str(ex))
-            self.logger.exception(msg)
-            raise RuntimeError(msg)
-
-    ##= = = = = ASOServerJob = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
-    def save_docs_in_transfer(self):
-        """ The function is used to save into a file the documents we are transfering so
-            we do not have to query couch to get this list every time the postjob is restarted.
-        """
-        try:
-            filename = 'transfer_info/docs_in_transfer.%s.%d.json' % (self.job_id, self.crab_retry)
-            with open(filename, 'w') as fd:
-                json.dump(self.docs_in_transfer, fd)
-        except:
-            #Only printing a generic message, the full stacktrace is printed in execute()
-            self.logger.error("Failed to save the docs in transfer. Aborting the postjob")
-            raise
-
-    ##= = = = = ASOServerJob = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
-    def load_docs_in_transfer(self):
-        """ Function that loads the object saved as a json by save_docs_in_transfer
-        """
-        try:
-            filename = 'transfer_info/docs_in_transfer.%s.%d.json' % (self.job_id, self.crab_retry)
-            with open(filename) as fd:
-                self.docs_in_transfer = json.load(fd)
-        except:
-            #Only printing a generic message, the full stacktrace is printed in execute()
-            self.logger.error("Failed to load the docs in transfer. Aborting the postjob")
-            raise
-
-    ##= = = = = ASOServerJob = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
-    def check_transfers(self):
-        self.load_docs_in_transfer()
-        failed_killed_transfers = []
-        done_transfers = []
-        starttime = time.time()
-        if self.aso_start_timestamp:
-            starttime = self.aso_start_timestamp
-        if first_pj_execution():
-            self.logger.info("====== Starting to monitor ASO transfers.")
-        try:
-            with getLock('get_transfers_statuses'):
-                ## Get the transfer status in all documents listed in self.docs_in_transfer.
-                transfers_statuses = self.get_transfers_statuses()
-        except TransferCacheLoadError as e:
-            self.logger.info("Error getting the status of the transfers. Deferring PJ. Got: %s" % e)
-            return 4
-        msg = "Got statuses: %s; %.1f hours since transfer submit."
-        msg = msg % (", ".join(transfers_statuses), (time.time()-starttime)/3600.0)
-        self.logger.info(msg)
-        all_transfers_finished = True
-        doc_ids = [doc_info['doc_id'] for doc_info in self.docs_in_transfer]
-        for transfer_status, doc_id in zip(transfers_statuses, doc_ids):
-            ## States to wait on.
-            if transfer_status in ['new', 'acquired', 'retry', 'unknown', 'submitted']:
-                all_transfers_finished = False
-                continue
-            ## Good states.
-            elif transfer_status in ['done']:
-                if doc_id not in done_transfers:
-                    done_transfers.append(doc_id)
-                continue
-            ## Bad states.
-            elif transfer_status in ['failed', 'killed', 'kill']:
-                if doc_id not in failed_killed_transfers:
-                    failed_killed_transfers.append(doc_id)
-                    msg = "Stageout job (internal ID %s) failed with status '%s'." % (doc_id, transfer_status)
-                    doc = self.load_transfer_document(doc_id)
-                    if doc and ('failure_reason' in doc) and doc['failure_reason']:
-                        ## reasons:  The transfer failure reason(s).
-                        ## app:      The application that gave the transfer failure reason(s).
-                        ##           E.g. 'aso' or '' (meaning the postjob). When printing the
-                        ##           transfer failure reasons (e.g. below), print also that the
-                        ##           failures come from the given app (if app != '').
-                        ## severity: Either 'permanent' or 'recoverable'.
-                        ##           It is set by PostJob in the perform_transfers() function,
-                        ##           when is_failure_permanent() is called to determine if a
-                        ##           failure is permanent or not.
-                        reasons, app, severity = doc['failure_reason'], 'aso', None
-                        msg += " Failure reasons follow:"
-                        if app:
-                            msg += "\n-----> %s log start -----" % str(app).upper()
-                        msg += "\n%s" % reasons
-                        if app:
-                            msg += "\n<----- %s log finish ----" % str(app).upper()
-                        self.logger.error(msg)
-                    else:
-                        reasons, app, severity = "Failure reason unavailable.", None, None
-                        self.logger.error(msg)
-                        self.logger.warning("WARNING: no failure reason available.")
-                    self.failures[doc_id] = {'reasons': reasons, 'app': app, 'severity': severity}
-            else:
-                exmsg = "Got an unknown transfer status: %s" % (transfer_status)
-                raise RuntimeError(exmsg)
-        if all_transfers_finished:
-            msg = "All transfers finished."
-            self.logger.info(msg)
-            if failed_killed_transfers:
-                msg  = "There were %d failed/killed transfers:" % (len(failed_killed_transfers))
-                msg += " %s" % (", ".join(failed_killed_transfers))
-                self.logger.info(msg)
-                self.logger.info("====== Finished to monitor ASO transfers.")
-                return 1
-            self.logger.info("====== Finished to monitor ASO transfers.")
-            return 0
-        ## If there is a timeout for transfers to complete, check if it was exceeded
-        ## and if so kill the ongoing transfers. # timeout = -1 means no timeout.
-        if self.retry_timeout != -1 and time.time() - starttime > self.retry_timeout:
-            msg  = "Post-job reached its timeout of %d seconds waiting for ASO transfers to complete." % (self.retry_timeout)
-            msg += " Will cancel ongoing ASO transfers."
-            self.logger.warning(msg)
-            self.logger.info("====== Starting to cancel ongoing ASO transfers.")
-            docs_to_cancel = {}
-            reason = "Cancelled ASO transfer after timeout of %d seconds." % (self.retry_timeout)
-            for doc_info in self.docs_in_transfer:
-                doc_id = doc_info['doc_id']
-                if doc_id not in done_transfers + failed_killed_transfers:
-                    docs_to_cancel.update({doc_id: reason})
-            cancelled, not_cancelled = self.cancel(docs_to_cancel, max_retries = 2)
-            for doc_id in cancelled:
-                failed_killed_transfers.append(doc_id)
-                app, severity = None, None
-                self.failures[doc_id] = {'reasons': reason, 'app': app, 'severity': severity}
-            if not_cancelled:
-                msg = "Failed to cancel %d ASO transfers: %s" % (len(not_cancelled), ", ".join(not_cancelled))
-                self.logger.error(msg)
-                self.logger.info("====== Finished to cancel ongoing ASO transfers.")
-                self.logger.info("====== Finished to monitor ASO transfers.")
-                return 2
-            self.logger.info("====== Finished to cancel ongoing ASO transfers.")
-            self.logger.info("====== Finished to monitor ASO transfers.")
-            return 1
-        ## defer the execution of the postjob
-        return 4
-
-    ##= = = = = ASOServerJob = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
-    def run(self):
-        """
-        This is the main method in ASOServerJob. Should be called after initializing
-        an instance.
-        """
-        with getLock('get_transfers_statuses'):
-            self.docs_in_transfer = self.inject_to_aso()
-        if self.docs_in_transfer == False:
-            exmsg = "Couldn't upload document to ASO database"
-            raise RuntimeError(exmsg)
-        if not self.docs_in_transfer:
-            self.logger.info("No files to transfer via ASO. Done!")
-            return 0
-        self.save_docs_in_transfer()
-        return 4
-
-    ##= = = = = ASOServerJob = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
-    def recordASOStartTime(self):
-        ## Add the post-job exit code and error message to the job report.
-        job_report = {}
-        try:
-            with open(G_JOB_REPORT_NAME) as fd:
-                job_report = json.load(fd)
-        except (IOError, ValueError):
-            pass
-        job_report['aso_start_timestamp'] = int(time.time())
-        job_report['aso_start_time'] = str(datetime.datetime.now())
-        with open(G_JOB_REPORT_NAME, 'w') as fd:
-            json.dump(job_report, fd)
-
-    ##= = = = = ASOServerJob = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
-    def inject_to_aso(self):
-        """
-        Inject documents to ASO database if not done by cmscp from worker node.
-        """
-        self.found_doc_in_db = False  # This is only for oracle implementation and we want to check before adding new doc.
-        self.logger.info("====== Starting to check uploads to ASO database.")
-        docs_in_transfer = []
-        output_files = []
-        now = str(datetime.datetime.now())
-        last_update = int(time.time())
-
-        if self.aso_start_timestamp == None or self.aso_start_time == None:
-            self.aso_start_timestamp = last_update
-            self.aso_start_time = now
-            msg  = "Unable to determine ASO start time from job report."
-            msg += " Will use ASO start time = %s (%s)."
-            msg  = msg % (self.aso_start_time, self.aso_start_timestamp)
-            self.logger.warning(msg)
-
-        role = str(self.job_ad['CRAB_UserRole'])
-        if str(self.job_ad['CRAB_UserRole']).lower() == 'undefined':
-            role = ''
-        group = str(self.job_ad['CRAB_UserGroup'])
-        if str(self.job_ad['CRAB_UserGroup']).lower() == 'undefined':
-            group = ''
-
-        task_publish = int(self.job_ad['CRAB_Publish'])
-
-        # TODO: Add a method to resolve a single PFN.
-        if self.transfer_outputs:
-            for output_module in self.job_report_output.values():
-                for output_file_info in output_module:
-                    file_info = {}
-                    file_info['checksums'] = output_file_info.get(u'checksums', {'cksum': '0', 'adler32': '0'})
-                    file_info['outsize'] = output_file_info.get(u'size', 0)
-                    file_info['direct_stageout'] = output_file_info.get(u'direct_stageout', False)
-                    if (output_file_info.get(u'output_module_class', '') == u'PoolOutputModule' or \
-                        output_file_info.get(u'ouput_module_class',  '') == u'PoolOutputModule'):
-                        file_info['filetype'] = 'EDM'
-                    elif output_file_info.get(u'Source', '') == u'TFileService':
-                        file_info['filetype'] = 'TFILE'
-                    else:
-                        file_info['filetype'] = 'FAKE'
-                    if u'pfn' in output_file_info:
-                        file_info['pfn'] = str(output_file_info[u'pfn'])
-                    output_files.append(file_info)
-        found_log = False
-        for source_site, filename in zip(self.source_sites, self.filenames):
-            ## We assume that the first file in self.filenames is the logs archive.
-            if found_log:
-                if not self.transfer_outputs:
-                    continue
-                source_lfn = os.path.join(self.source_dir, filename)
-                dest_lfn = os.path.join(self.dest_dir, filename)
-                file_type = 'output'
-                ifile = get_file_index(filename, output_files)
-                if ifile is None:
-                    continue
-                size = output_files[ifile]['outsize']
-                checksums = output_files[ifile]['checksums']
-                ## needs_transfer is False if and only if the file was staged out
-                ## from the worker node directly to the permanent storage.
-                needs_transfer = not output_files[ifile]['direct_stageout']
-                file_output_type = output_files[ifile]['filetype']
-            else:
-                found_log = True
-                if not self.transfer_logs:
-                    continue
-                source_lfn = os.path.join(self.source_dir, 'log', filename)
-                dest_lfn = os.path.join(self.dest_dir, 'log', filename)
-                file_type = 'log'
-                size = self.log_size
-                checksums = {'adler32': 'abc'}
-                ## needs_transfer is False if and only if the file was staged out
-                ## from the worker node directly to the permanent storage.
-                needs_transfer = self.log_needs_transfer
-            self.logger.info("Working on file %s" % (filename))
-            doc_id = hashlib.sha224(source_lfn).hexdigest()
-            doc_new_info = {'state': 'new',
-                            'source': source_site,
-                            'destination': self.dest_site,
-                            'checksums': checksums,
-                            'size': size,
-                            'last_update': last_update,
-                            'start_time': now,
-                            'end_time': '',
-                            'job_end_time': time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time())),
-                            'retry_count': [],
-                            'failure_reason': [],
-                            ## The 'job_retry_count' is used by ASO when reporting to dashboard,
-                            ## so it is OK to set it equal to the crab (post-job) retry count.
-                            'job_retry_count': self.crab_retry,
-                           }
-            if not needs_transfer:
-                msg  = "File %s is marked as having been directly staged out"
-                msg += " from the worker node to the permanent storage."
-                msg  = msg % (filename)
-                self.logger.info(msg)
-                doc_new_info['state'] = 'done'
-                doc_new_info['end_time'] = now
-            ## Set the publication flag.
-            publication_msg = None
-            if file_type == 'output':
-                publish = task_publish
-                if publish and self.job_failed:
-                    publication_msg  = "Disabling publication of output file %s,"
-                    publication_msg += " because job is marked as failed."
-                    publication_msg  = publication_msg % (filename)
-                    publish = 0
-                if publish and file_output_type != 'EDM':
-                    publication_msg  = "Disabling publication of output file %s,"
-                    publication_msg += " because it is not of EDM type."
-                    publication_msg  = publication_msg % (filename)
-                    publish = 0
-            else:
-                ## This is the log file, so obviously publication should be turned off.
-                publish = 0
-            ## What does ASO needs to do for this file (transfer and/or publication) is
-            ## saved in this list for the only purpose of printing a better message later.
-            aso_tasks = []
-            if needs_transfer:
-                aso_tasks.append("transfer")
-            if publish:
-                aso_tasks.append("publication")
-            if not (needs_transfer or publish):
-                ## This file doesn't need transfer nor publication, so we don't need to upload
-                ## a document to ASO database.
-                if publication_msg:
-                    self.logger.info(publication_msg)
-                msg  = "File %s doesn't need transfer nor publication."
-                msg += " No need to inject a document to ASO."
-                msg  = msg % (filename)
-                self.logger.info(msg)
-            else:
-                ## This file needs transfer and/or publication. If a document (for the current
-                ## job retry) is not yet in ASO database, we need to do the upload.
-                needs_commit = True
-                try:
-                    doc = self.getDocByID(doc_id)
-                    ## The document was already uploaded to ASO database. It could have been
-                    ## uploaded from the WN in the current job retry or in a previous job retry,
-                    ## or by the postjob in a previous job retry.
-                    transfer_status = doc.get('state')
-                    if not transfer_status:
-                        # This means it is RDBMS database as we changed fields to match what they are :)
-                        transfer_status = doc.get('transfer_state')
-                    if doc.get('start_time') == self.aso_start_time or \
-                       doc.get('start_time') == self.aso_start_timestamp:
-                        ## The document was uploaded from the WN in the current job retry, so we don't
-                        ## upload a new document. (If the transfer is done or ongoing, then of course we
-                        ## don't want to re-inject the transfer request. OTOH, if the transfer has
-                        ## failed, we don't want the postjob to retry it; instead the postjob will exit
-                        ## and the whole job will be retried).
-                        msg  = "LFN %s (id %s) is already in ASO database"
-                        msg += " (it was injected from the worker node in the current job retry)"
-                        msg += " and file transfer status is '%s'."
-                        msg  = msg % (source_lfn, doc_id, transfer_status)
-                        self.logger.info(msg)
-                        needs_commit = False
-                    else:
-                        ## The document was uploaded in a previous job retry. This means that in the
-                        ## current job retry the injection from the WN has failed or cmscp did a direct
-                        ## stageout. We upload a new stageout request, unless the transfer is still
-                        ## ongoing (which should actually not happen, unless the postjob for the
-                        ## previous job retry didn't run).
-                        msg  = "LFN %s (id %s) is already in ASO database (file transfer status is '%s'),"
-                        msg += " but does not correspond to the current job retry."
-                        msg  = msg % (source_lfn, doc_id, transfer_status)
-                        if transfer_status in ['acquired', 'new', 'retry']:
-                            msg += "\nFile transfer status is not terminal ('done', 'failed' or 'killed')."
-                            msg += " Will not inject a new document for the current job retry."
-                            self.logger.info(msg)
-                            needs_commit = False
-                        else:
-                            msg += " Will inject a new %s request." % (' and '.join(aso_tasks))
-                            self.logger.info(msg)
-                            msg = "Previous document: %s" % (pprint.pformat(doc))
-                            self.logger.debug(msg)
-                except (CMSCouch.CouchNotFoundError, NotFound):
-                    ## The document was not yet uploaded to ASO database (if this is the first job
-                    ## retry, then either the upload from the WN failed, or cmscp did a direct
-                    ## stageout and here we need to inject for publication only). In any case we
-                    ## have to inject a new document.
-                    msg  = "LFN %s (id %s) is not in ASO database."
-                    msg += " Will inject a new %s request."
-                    msg  = msg % (source_lfn, doc_id, ' and '.join(aso_tasks))
-                    self.logger.info(msg)
-                    if publication_msg:
-                        self.logger.info(publication_msg)
-                    input_dataset = str(self.job_ad['DESIRED_CMSDataset'])
-                    if str(self.job_ad['DESIRED_CMSDataset']).lower() == 'undefined':
-                        input_dataset = ''
-                    primary_dataset = str(self.job_ad['CRAB_PrimaryDataset'])
-                    if input_dataset:
-                        input_dataset_or_primary_dataset = input_dataset
-                    elif primary_dataset:
-                        input_dataset_or_primary_dataset = '/'+primary_dataset # Adding the '/' until we fix ASO
-                    else:
-                        input_dataset_or_primary_dataset = '/'+'NotDefined' # Adding the '/' until we fix ASO
-                    doc = {'_id': doc_id,
-                           'inputdataset': input_dataset_or_primary_dataset,
-                           'rest_host': str(self.job_ad['CRAB_RestHost']),
-                           'rest_uri': str(self.job_ad['CRAB_RestURInoAPI']),
-                           'lfn': source_lfn,
-                           'source_lfn': source_lfn,
-                           'destination_lfn': dest_lfn,
-                           'checksums': checksums,
-                           'user': str(self.job_ad['CRAB_UserHN']),
-                           'group': group,
-                           'role': role,
-                           'dbs_url': str(self.job_ad['CRAB_DBSURL']),
-                           'workflow': self.reqname,
-                           'jobid': self.job_id,
-                           'publication_state': 'not_published',
-                           'publication_retry_count': [],
-                           'type': file_type,
-                           'publish': publish,
-                          }
-                    ## TODO: We do the following, only because that's what ASO does when a file has
-                    ## been successfully transferred. But this modified LFN makes no sence when it
-                    ## starts with /store/temp/user/, because the modified LFN is then
-                    ## /store/user/<username>.<hash>/bla/blabla, i.e. it contains the <hash>, which
-                    ## is never part of a destination LFN, but only of temp source LFNs.
-                    ## Once ASO uses the source_lfn and the destination_lfn instead of only the lfn,
-                    ## this should not be needed anymore.
-                    if not needs_transfer:
-                        doc['lfn'] = source_lfn.replace('/store/temp', '/store', 1)
-                except Exception as ex:
-                    msg = "Error loading document from ASO database: %s" % (str(ex))
-                    try:
-                        msg += "\n%s" % (traceback.format_exc())
-                    except AttributeError:
-                        msg += "\nTraceback unavailable."
-                    self.logger.error(msg)
-                    return False
-                ## If after all we need to upload a new document to ASO database, let's do it.
-                if needs_commit:
-                    doc.update(doc_new_info)
-                    msg = "ASO job description: %s" % (pprint.pformat(doc))
-                    self.logger.info(msg)
-                    commit_result_msg = self.updateOrInsertDoc(doc)
-                    if 'error' in commit_result_msg:
-                        msg = "Error injecting document to ASO database:\n%s" % (commit_result_msg)
-                        self.logger.info(msg)
-                        return False
-                    ## If the upload succeds then record the timestamp in the fwjr (if not already present)
-                    self.recordASOStartTime()
-                ## Record all files for which we want the post-job to monitor their transfer.
-                if needs_transfer:
-                    doc_info = {'doc_id'     : doc_id,
-                                'start_time' : doc.get('start_time')
-                               }
-                    docs_in_transfer.append(doc_info)
-
-        self.logger.info("====== Finished to check uploads to ASO database.")
-
-        return docs_in_transfer
-
-    ##= = = = = ASOServerJob = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
-    def getDocByID(self, doc_id):
-        if not isCouchDBURL(self.aso_db_url):
-            docInfo = self.server.get(self.rest_uri_file_user_transfers, data=encodeRequest({'subresource': 'getById', "id": doc_id}))
-            if docInfo and len(docInfo[0]['result']) == 1:
-                # Means that we have already a document in database!
-                docInfo = oracleOutputMapping(docInfo)
-                # Just to be 100% sure not to break after the mapping been added
-                if not docInfo:
-                    self.found_doc_in_db = False
-                    raise NotFound('Document not found in database')
-                # transfer_state and publication_state is a number in database. Lets change
-                # it to lowercase until we will end up support for CouchDB.
-                docInfo[0]['transfer_state'] = TRANSFERDB_STATES[docInfo[0]['transfer_state']].lower()
-                docInfo[0]['publication_state'] = PUBLICATIONDB_STATES[docInfo[0]['publication_state']].lower()
-                # Also change id to doc_id
-                docInfo[0]['job_id'] = docInfo[0]['id']
-                self.found_doc_in_db = True  # This is needed for further if there is a need to update doc info in DB
-                return docInfo[0]
-            else:
-                self.found_doc_in_db = False
-                raise NotFound('Document not found in database!')
-        else:
-            return self.couch_database.document(doc_id)
-
-    def updateOrInsertDoc(self, doc):
-        """"""
-        returnMsg = {}
-        if not isCouchDBURL(self.aso_db_url):
-            if not self.found_doc_in_db:
-                # This means that it was not founded in DB and we will have to insert new doc
-                newDoc = {'id': doc['_id'],
-                          'username': doc['user'],
-                          'taskname': doc['workflow'],
-                          'start_time': self.aso_start_timestamp,
-                          'destination': doc['destination'],
-                          'destination_lfn': doc['destination_lfn'],
-                          'source': doc['source'],
-                          'source_lfn': doc['source_lfn'],
-                          'filesize': doc['size'],
-                          'publish': doc['publish'],
-                          'transfer_state': doc['state'].upper(),
-                          'publication_state': 'NEW' if doc['publish'] else 'NOT_REQUIRED',
-                          'job_id': doc['jobid'],
-                          'job_retry_count': doc['job_retry_count'],
-                          'type': doc['type'],
-                          'rest_host': doc['rest_host'],
-                          'rest_uri': doc['rest_uri']}
-                try:
-                    self.server.put(self.rest_uri_file_user_transfers, data=encodeRequest(newDoc))
-                except HTTPException as hte:
-                    msg  = "Error uploading document to database."
-                    msg += " Transfer submission failed."
-                    msg += "\n%s" % (str(hte.headers))
-                    returnMsg['error'] = msg
-            else:
-                # This means it is in database and we need only update specific fields.
-                newDoc = {'id': doc['id'],
-                          'username': doc['username'],
-                          'taskname': doc['taskname'],
-                          'start_time': self.aso_start_timestamp,
-                          'source': doc['source'],
-                          'source_lfn': doc['source_lfn'],
-                          'filesize': doc['filesize'],
-                          'transfer_state': doc.get('state', 'NEW').upper(),
-                          'publication_state': 'NEW' if doc['publish'] else 'NOT_REQUIRED',
-                          'job_id': doc['jobid'],
-                          'job_retry_count': doc['job_retry_count'],
-                          'transfer_retry_count': 0,
-                          'subresource': 'updateDoc'}
-                try:
-                    self.server.post(self.rest_uri_file_user_transfers, data=encodeRequest(newDoc))
-                except HTTPException as hte:
-                    msg  = "Error updating document in database."
-                    msg += " Transfer submission failed."
-                    msg += "\n%s" % (str(hte.headers))
-                    returnMsg['error'] = msg
-        else:
-            returnMsg = self.couch_database.commitOne(doc)[0]
-        return returnMsg
-
-    ##= = = = = ASOServerJob = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
-    def build_failed_cache(self):
-        aso_info = {
-            "query_timestamp": time.time(),
-            "query_succeded": False,
-            "query_jobid": self.job_id,
-            "results": {},
-        }
-        tmp_fname = "aso_status.%d.json" % (os.getpid())
-        with open(tmp_fname, 'w') as fd:
-            json.dump(aso_info, fd)
-        os.rename(tmp_fname, "aso_status.json")
-
-    ##= = = = = ASOServerJob = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
-    def get_transfers_statuses(self):
-        """
-        Retrieve the status of all transfers from the cached file 'aso_status.json'
-        or by querying an ASO database view if the file is more than 5 minutes old
-        or if we injected a document after the file was last updated. Calls to
-+       get_transfers_statuses_fallback() have been removed to not generate load
-        on couch.
-        """
-        statuses = []
-        query_view = False
-        if not os.path.exists("aso_status.json"):
-            query_view = True
-        aso_info = {}
-        if not query_view:
-            query_view = True
-            try:
-                with open("aso_status.json") as fd:
-                    aso_info = json.load(fd)
-            except:
-                msg = "Failed to load transfer cache."
-                self.logger.exception(msg)
-                raise TransferCacheLoadError(msg)
-            last_query = aso_info.get("query_timestamp", 0)
-            last_jobid = aso_info.get("query_jobid", "unknown")
-            last_succeded = aso_info.get("query_succeded", True)
-            # We can use the cached data if:
-            # - It is from the last 15 minutes, AND
-            # - It is from after we submitted the transfer.
-            # Without the second condition, we run the risk of using the previous stageout
-            # attempts results.
-            if (time.time() - last_query < 900) and (last_query > self.aso_start_timestamp):
-                self.logger.info("Using the cache since it is up to date (last_query=%s) and it is after we submitted the transfer (aso_start_timestamp=%s)", last_query, self.aso_start_timestamp)
-                query_view = False
-                if not last_succeded:
-                    #no point in continuing if the last query failed. Just defer the PJ and retry later
-                    msg = ("Not using info about transfer statuses from the trasnfer cache. "
-                           "Deferring the postjob."
-                           "PJ num %s failed to load the information from the DB and cache has not expired yet." % last_jobid)
-                    raise TransferCacheLoadError(msg)
-            for doc_info in self.docs_in_transfer:
-                doc_id = doc_info['doc_id']
-                if doc_id not in aso_info.get("results", {}):
-                    self.logger.debug("Changing query_view back to true")
-                    query_view = True
-                    break
-        if isCouchDBURL(self.aso_db_url):
-            if query_view:
-                query = {'reduce': False, 'key': self.reqname, 'stale': 'update_after'}
-                self.logger.debug("Querying ASO view.")
-                try:
-                    view_results = self.couch_database.loadView('AsyncTransfer', 'JobsIdsStatesByWorkflow', query)['rows']
-                    view_results_dict = {}
-                    for view_result in view_results:
-                        view_results_dict[view_result['id']] = view_result
-                except:
-                    msg = "Error while querying the NoSQL (Couch) database."
-                    self.logger.exception(msg)
-                    self.build_failed_cache()
-                    raise TransferCacheLoadError(msg)
-                aso_info = {
-                    "query_timestamp": time.time(),
-                    "query_succeded": True,
-                    "query_jobid": self.job_id,
-                    "results": view_results_dict,
-                }
-                tmp_fname = "aso_status.%d.json" % (os.getpid())
-                with open(tmp_fname, 'w') as fd:
-                    json.dump(aso_info, fd)
-                os.rename(tmp_fname, "aso_status.json")
-            else:
-                self.logger.debug("Using cached ASO results.")
-            #Is this ever happening?
-            if not aso_info:
-                raise TransferCacheLoadError("Unexpected error. aso_info is not set. Deferring postjob")
-            for doc_info in self.docs_in_transfer:
-                doc_id = doc_info['doc_id']
-                if doc_id not in aso_info.get("results", {}):
-                    ## This is a legitimate use case. It can happen if the document has just been injected
-                    ## (e.g.: transfer injected in the PJ and not in the WN). In this case the cache does not
-                    ## have the document yet, so we defer the postjob.
-                    msg = "Document with id %s not found in the transfer cache." % doc_id
-                    raise TransferCacheLoadError(msg)
-                ## Use the start_time parameter to check whether the transfer state in aso_info
-                ## corresponds to the document we have to monitor. The reason why we have to do
-                ## this check is because the information in aso_info might have been obtained by
-                ## querying an ASO CouchDB view, which can return stale results. We don't mind
-                ## having stale results as long as they correspond to the documents we have to
-                ## monitor (the worst that can happen is that we will wait more than necessary
-                ## to see the transfers in a terminal state). But it could be that some results
-                ## returned by the view correspond to documents injected in a previous job retry
-                ## (or restart), and this is not what we want. If the start_time in aso_info is
-                ## not the same as in the document (we saved the start_time from the documents
-                ## in self.docs_in_transfer), then the view result corresponds to a previous job
-                ## retry. In that case, return transfer state = 'unknown'.
-                transfer_status = aso_info['results'][doc_id]['value']['state']
-                if 'start_time' in aso_info['results'][doc_id]['value']:
-                    start_time = aso_info['results'][doc_id]['value']['start_time']
-                    if start_time == doc_info['start_time']:
-                        statuses.append(transfer_status)
-                    else:
-                        msg  = "Got stale transfer state '%s' for document %s" % (transfer_status, doc_id)
-                        msg += " (got start_time = %s, while in the document is start_time = %s)." % (start_time, doc_info['start_time'])
-                        msg += " Transfer state may correspond to a document from a previous job retry."
-                        msg += " Returning transfer state = 'unknown'."
-                        self.logger.info(msg)
-                        statuses.append('unknown')
-                else:
-                    statuses.append(transfer_status)
-        elif not isCouchDBURL(self.aso_db_url):
-            if query_view:
-                self.logger.debug("Querying ASO RDBMS database.")
-                try:
-                    view_results = self.server.get(self.rest_uri_file_user_transfers, data=encodeRequest({'subresource': 'getTransferStatus',
-                                                                                                          'username': str(self.job_ad['CRAB_UserHN']),
-                                                                                                          'taskname': self.reqname}))
-                    view_results_dict = oracleOutputMapping(view_results, 'id')
-                    # There is so much noise values in aso_status.json file. So lets provide a new file structure.
-                    # We will not run ever for one task which can use also RDBMS and CouchDB
-                    # New Structure for view_results_dict is
-                    # {"DocumentHASHID": [{"id": "DocumentHASHID", "start_time": timestamp, "transfer_state": NUMBER!, "last_update": timestamp}]}
-                    for document in view_results_dict:
-                        view_results_dict[document][0]['state'] = TRANSFERDB_STATES[view_results_dict[document][0]['transfer_state']].lower()
-                except:
-                    msg = "Error while querying the RDBMS (Oracle) database."
-                    self.logger.exception(msg)
-                    self.build_failed_cache()
-                    raise TransferCacheLoadError(msg)
-                aso_info = {
-                    "query_timestamp": time.time(),
-                    "query_succeded": True,
-                    "query_jobid": self.job_id,
-                    "results": view_results_dict,
-                }
-                tmp_fname = "aso_status.%d.json" % (os.getpid())
-                with open(tmp_fname, 'w') as fd:
-                    json.dump(aso_info, fd)
-                os.rename(tmp_fname, "aso_status.json")
-            else:
-                self.logger.debug("Using cached ASO results.")
-            if not aso_info:
-                raise TransferCacheLoadError("Unexpected error. aso_info is not set. Deferring postjob")
-            for doc_info in self.docs_in_transfer:
-                doc_id = doc_info['doc_id']
-                if doc_id not in aso_info.get("results", {}):
-                    msg = "Document with id %s not found in the transfer cache. Deferring PJ." % doc_id
-                    raise TransferCacheLoadError(msg)                ## Not checking timestamps for oracle since we are not injecting from WN
-                ## and it cannot happen that condor restarts screw up things.
-                transfer_status = aso_info['results'][doc_id][0]['state']
-                statuses.append(transfer_status)
-        return statuses
-
-    ##= = = = = ASOServerJob = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
-    def load_transfer_document(self, doc_id):
-        """
-        Wrapper to load a document from CouchDB or RDBMS, catching exceptions.
-        """
-        doc = None
-        try:
-            if not isCouchDBURL(self.aso_db_url):
-                doc = self.getDocByID(doc_id)
-            else:
-                doc = self.couch_database.document(doc_id)
-        except CMSCouch.CouchError as cee:
-            msg = "Error retrieving document from ASO database for ID %s: %s" % (doc_id, str(cee))
-            self.logger.error(msg)
-        except HTTPException as hte:
-            msg = "Error retrieving document from ASO database for ID %s: %s" % (doc_id, str(hte.headers))
-            self.logger.error(msg)
-        except Exception:
-            msg = "Error retrieving document from ASO database for ID %s" % (doc_id)
-            self.logger.exception(msg)
-        except NotFound as er:
-            msg = "Document is not found in ASO RDBMS database for ID %s" % (doc_id)
-            self.logger.warning(msg)
-        return doc
-
-    ##= = = = = ASOServerJob = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
-    def get_transfers_statuses_fallback(self):
-        """
-        Retrieve the status of all transfers by loading the corresponding documents
-        from ASO database and checking the 'state' field.
-        """
-        msg = "Querying transfers statuses using fallback method (i.e. loading each document)."
-        self.logger.debug(msg)
-        statuses = []
-        for doc_info in self.docs_in_transfer:
-            doc_id = doc_info['doc_id']
-            doc = self.load_transfer_document(doc_id)
-            if isCouchDBURL(self.aso_db_url):
-                status = doc['state'] if doc else 'unknown'
-            else:
-               status = doc['transfer_state'] if doc else 'unknown'
-            statuses.append(status)
-        return statuses
-
-    ##= = = = = ASOServerJob = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
-    def cancel(self, doc_ids_reasons = None, max_retries = 0):
-        """
-        Method used to "cancel/kill" ASO transfers. The only thing that this
-        function does is to put the 'state' field of the corresponding documents in
-        the ASO database to 'killed' (and the 'end_time' field to the current time).
-        Killing actual FTS transfers (if possible) is left to ASO.
-        """
-        if doc_ids_reasons is None:
-            for doc_info in self.docs_in_transfer:
-                doc_id = doc_info['doc_id']
-                doc_ids_reasons[doc_id] = None
-        if not doc_ids_reasons:
-            msg = "There are no ASO transfers to cancel."
-            self.logger.info(msg)
-            return [], []
-        now = str(datetime.datetime.now())
-        cancelled, not_cancelled = [], []
-        max_retries = max(int(max_retries), 0)
-        transfersToKill = []  # This is for RDBMS implementation only
-        if max_retries:
-            msg = "In case of cancellation failure, will retry up to %d times." % (max_retries)
-            self.logger.info(msg)
-        for retry in range(max_retries + 1):
-            if retry > 0:
-                time.sleep(3*60)
-                msg = "This is cancellation retry number %d." % (retry)
-                self.logger.info(msg)
-            for doc_id, reason in doc_ids_reasons.iteritems():
-                if doc_id in cancelled:
-                    continue
-                msg = "Cancelling ASO transfer %s" % (doc_id)
-                if reason:
-                    msg += " with following reason: %s" % (reason)
-                self.logger.info(msg)
-                doc = self.load_transfer_document(doc_id)
-                if not doc:
-                    msg = "Could not cancel ASO transfer %s; failed to load document." % (doc_id)
-                    self.logger.warning(msg)
-                    if retry == max_retries:
-                        not_cancelled.append((doc_id, msg))
-                    continue
-                doc['state'] = 'killed'
-                doc['end_time'] = now
-                if isCouchDBURL(self.aso_db_url):
-                    # In case it is still CouchDB leave this in this loop and for RDBMS add
-                    # everything to a list and update this with one call for multiple files.
-                    # One bad thing that we are not saving failure reason. It should not be a big deal
-                    # to implement, but I leave it so far to discuss how it is best to do it.
-                    # I think best is to show the last reason and not all.
-                    if reason:
-                        if doc['failure_reason']:
-                            if isinstance(doc['failure_reason'], list):
-                                doc['failure_reason'].append(reason)
-                            elif isinstance(doc['failure_reason'], str):
-                                doc['failure_reason'] = [doc['failure_reason'], reason]
-                        else:
-                            doc['failure_reason'] = reason
-                    res = self.couch_database.commitOne(doc)[0]
-                    if 'error' in res:
-                        msg = "Error cancelling ASO transfer %s: %s" % (doc_id, res)
-                        self.logger.warning(msg)
-                        if retry == max_retries:
-                            not_cancelled.append((doc_id, msg))
-                    else:
-                        cancelled.append(doc_id)
-                else:
-                    transfersToKill.append(doc_id)
-
-        if not isCouchDBURL(self.aso_db_url):
-            # Now this means that we have a list of ids which needs to be killed
-            # First try to kill ALL in one API call
-            newDoc = {'listOfIds': transfersToKill,
-                      'subresource': 'killTransfersById'}
-            try:
-                killedFiles = self.server.post(self.rest_uri_file_user_transfers, data=encodeRequest(newDoc, ['listOfIds']))
-                not_cancelled = killedFiles[0]['result'][0]['failedKill']
-                cancelled = killedFiles[0]['result'][0]['killed']
-            except HTTPException as hte:
-                msg  = "Error setting KILL status in database."
-                msg += " Transfer KILL failed."
-                msg += "\n%s" % (str(hte.headers))
-                self.logger.warning(msg)
-                not_cancelled = transfersToKill
-                cancelled = []
-            # Ok Now lets do a double check on doc_ids which failed to update one by one.
-            # It is just to make proof concept to cover KILL to RDBMS
-            self.logger.info("Failed to kill %s and succeeded to kill %s", not_cancelled, cancelled)
-            transfersToKill = list(set(transfersToKill) - set(cancelled))
-            # Now if there are any transfers left which failed to be killed, try to get it's status
-            # and also kill if status is not in KILL or KILLED
-            for docIdKill in transfersToKill:
-                newDoc = {'listOfIds': [docIdKill],
-                          'subresource': 'killTransfersById'}
-                try:
-                    doc_out = self.getDocByID(docIdKill)
-                    if doc_out['transfer_state'] not in ['kill', 'killed']:
-                        killedFiles = self.server.post(self.rest_uri_file_user_transfers, data=encodeRequest(newDoc, ['listOfIds']))
-                        failedFiles = killedFiles[0]['result'][0]['failedKill']
-                        notfailedFiles = killedFiles[0]['result'][0]['killed']
-                        if failedFiles:
-                            not_cancelled.append(docIdKill)
-                        elif notfailedFiles:
-                            cancelled.append(docIdKill)
-                    else:
-                        cancelled.append(docIdKill)
-                except HTTPException as hte:
-                    msg  = "Error setting KILL status in database."
-                    msg += " Transfer KILL failed."
-                    msg += "\n%s" % (str(hte.headers))
-                    self.logger.warning(msg)
-                    not_cancelled.append(docIdKill)
-                    cancelled.append(docIdKill)
-                except NotFound as er:
-                    # This is strange that document is not found in database.
-                    # Just add it as canceled and move on.
-                    cancelled.append(docIdKill)
-        return cancelled, not_cancelled
-
-    ##= = = = = ASOServerJob = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
-    def get_failures(self):
-        """
-        Retrieve failures bookeeping dictionary.
-        """
-        return self.failures
-
-##==============================================================================
-
-class PostJob():
+class PostJob(object):
     """
     Executes on schedd once for each job.
     Checks the job exit status and determines if an error is recoverable or fatal.
@@ -1256,8 +180,6 @@ class PostJob():
         self.logger.propagate = False
         self.postjob_log_file_name = None
 
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
     def get_defer_num(self):
 
         DEFER_INFO_FILE = 'defer_info/defer_num.%s.%d.txt' % (self.job_id, self.dag_retry)
@@ -1305,8 +227,6 @@ class PostJob():
 
         return defer_num
 
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
     def create_taskwebdir(self):
         ## Create the task web directory in the schedd.
         self.logpath = os.path.expanduser("~/%s" % (self.reqname))
@@ -1317,8 +237,6 @@ class PostJob():
                 msg = "Failed to create log web-shared directory %s" % (self.logpath)
                 self.logger.error(msg)
                 raise
-
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
     def handle_logfile(self):
         ## Create a file handler (or a stream handler to stdout), flush the memory
@@ -1343,8 +261,6 @@ class PostJob():
             os.chmod(self.postjob_log_file_name, 0o644)
             os.dup2(fd_postjob_log, 1)
             os.dup2(fd_postjob_log, 2)
-
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
     def handle_webdir(self):
         ## If the post-job log file exists, create a symbolic link in the task web
@@ -1411,8 +327,6 @@ class PostJob():
                 msg += "\nDetails follow:"
                 self.logger.exception(msg)
                 self.logger.info("Continuing since this is not a critical error.")
-
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
     def execute(self, *args, **kw):
         """
@@ -1585,15 +499,11 @@ class PostJob():
 
         return retval
 
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
     def log_finish_msg(self, retval):
         """
         Logs a message with the post-job return code.
         """
         self.logger.info("======== Finished post-job execution with status code %s." % (retval))
-
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
     def check_exit_code(self, used_job_ad):
         """ Execute the retry-job. The retry-job decides whether an error is recoverable
@@ -1657,8 +567,6 @@ class PostJob():
         else:
             self.logger.info("====== Finished to analyze job exit status.")
         return res
-
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
     def adjustLumisForCompletion(self, task):
         """
@@ -1770,9 +678,6 @@ class PostJob():
             subprocess.check_call(['condor_submit_dag', '-AutoRescue', '0', '-MaxPre', '20', '-MaxIdle', '1000',
                 '-MaxPost', str(self.job_ad.get('CRAB_MaxPost', 20)), '-no_submit', '-insert_sub_file', 'subdag.ad',
                 '-append', '+Environment = strcat(Environment," _CONDOR_DAGMAN_LOG={0}/{1}.dagman.out")'.format(os.getcwd(), dag), dag])
-
-
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
     def execute_internal(self):
         """
@@ -2009,8 +914,6 @@ class PostJob():
 
         return 0, ""
 
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
     def print_env_and_ads(self):
         """
         Save environment variables which are used in postjob_env.txt if file is not
@@ -2042,8 +945,6 @@ class PostJob():
         else:
             self.logger.debug("------ Job ad is not available. Continue")
             self.logger.debug("-"*100)
-
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
     def perform_transfers(self):
         """
@@ -2151,8 +1052,6 @@ class PostJob():
         else:
             raise RecoverableStageoutError(msg)
 
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
     def upload_log_file_metadata(self):
         """
         Upload the logs archive file metadata.
@@ -2198,8 +1097,6 @@ class PostJob():
             if not hte.headers.get('X-Error-Detail', '') == 'Object already exists' or \
                not hte.headers.get('X-Error-Http', -1) == '400':
                 raise
-
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
     def upload_input_files_metadata(self):
         """
@@ -2265,8 +1162,6 @@ class PostJob():
                 msg = "Error uploading input file metadata: %s" % (str(hte.headers))
                 self.logger.error(msg)
                 raise
-
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
     def upload_output_files_metadata(self):
         """
@@ -2367,8 +1262,6 @@ class PostJob():
                 msg = "Error writing the output_datasets file"
                 self.logger.error(msg)
 
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
     def parse_job_ad(self, job_ad_file_name):
         """
         Parse the job ad, setting some class variables.
@@ -2417,8 +1310,6 @@ class PostJob():
             self.transfer_logs = 0
         return 0
 
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
     def check_required_job_ad_attrs(self):
         """
         Check if all the required attributes from the job ad are there.
@@ -2461,8 +1352,6 @@ class PostJob():
             self.logger.error(msg)
             return 1
         return 0
-
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
     def parse_job_report(self):
         """
@@ -2510,8 +1399,6 @@ class PostJob():
         self.aso_start_time = self.job_report.get("aso_start_time", None)
         self.aso_start_timestamp = self.job_report.get("aso_start_timestamp", None)
         return 0
-
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
     def fill_output_files_info(self):
         """
@@ -2579,8 +1466,6 @@ class PostJob():
                 msg = "Output file info for %s not found in job report." % (orig_file_name)
                 self.logger.error(msg)
 
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
     def set_dashboard_state(self, state, reason = None, exitCode = None):
         """
         Set the state of the job in Dashboard.
@@ -2640,8 +1525,6 @@ class PostJob():
         DashboardAPI.apmonSend(params['MonitorID'], params['MonitorJobID'], params)
         self.logger.info("====== Finished to prepare/send report to dashboard.")
 
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
     def get_file_source_site(self, file_name, ifile = None):
         """
         Get the source site for the given file.
@@ -2653,8 +1536,6 @@ class PostJob():
         if self.job_report.get(u'temp_storage_site', 'unknown') != 'unknown':
             return self.job_report.get(u'temp_storage_site')
         return self.executed_site
-
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
     def calculate_crab_retry(self):
         """
@@ -2694,8 +1575,6 @@ class PostJob():
             crab_retry = retry_info['post'] - 1
         return 0, crab_retry
 
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
     def check_retry_count(self, exitCode=None):
         """
         When a recoverable error happens, we still have to check if the maximum allowed
@@ -2713,8 +1592,6 @@ class PostJob():
             self.logger.info(msg)
             self.set_dashboard_state('COOLOFF', exitCode=exitCode)
             return JOB_RETURN_CODES.RECOVERABLE_ERROR
-
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
     def check_abort_dag(self, rval):
         """
@@ -2759,8 +1636,6 @@ class PostJob():
         finally:
             return rval
 
-    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
     def processWMArchive(self, retval):
         WMARCHIVE_BASE_LOCATION = json.load(open("/etc/wmarchive.json")).get("BASE_DIR", "/data/wmarchive")
 
@@ -2782,115 +1657,6 @@ class PostJob():
         #not using shutil.move because I want to move the file in the same disk
         os.rename(G_WMARCHIVE_REPORT_NAME_NEW, os.path.join(WMARCHIVE_BASE_LOCATION, 'new', "%s_%s" % (self.reqname, G_WMARCHIVE_REPORT_NAME_NEW)))
 
-##==============================================================================
-
-class PermanentStageoutError(RuntimeError):
-    pass
-
-class RecoverableStageoutError(RuntimeError):
-    pass
-
-class TransferCacheLoadError(RuntimeError):
-    pass
-
-##==============================================================================
-
-def get_file_index(file_name, output_files):
-    """
-    Get the index location of the given file name within the list of output files
-    dict infos from the job report.
-    """
-    for i, outfile in enumerate(output_files):
-        if ('pfn' not in outfile):
-            continue
-        json_pfn = os.path.split(outfile['pfn'])[-1]
-        pfn = os.path.split(file_name)[-1]
-        left_piece, fileid = pfn.rsplit("_", 1)
-        right_piece = fileid.split(".", 1)[-1]
-        pfn = left_piece + "." + right_piece
-        if pfn == json_pfn:
-            return i
-    return None
-
-##==============================================================================
-
-class testServer(unittest.TestCase):
-    def generateJobJson(self, sourceSite = 'srm.unl.edu'):
-        return {"steps" : {
-            "cmsRun" : { "input" : {},
-              "output":
-                {"outmod1" :
-                    [ { "output_module_class": "PoolOutputModule",
-                        "input": ["/test/input2",
-                                   "/test/input2"
-                                  ],
-                        "events": 200,
-                        "size": 100,
-                        "SEName": sourceSite,
-                        "runs": { 1: [1, 2, 3],
-                                   2: [2, 3, 4]},
-                      }]}}}}
-
-
-    def setUp(self):
-        self.postjob = PostJob()
-        #self.job = ASOServerJob()
-        #status, crab_retry, max_retries, restinstance, resturl, reqname, id,
-        #outputdata, job_sw, async_dest, source_dir, dest_dir, *filenames
-        self.full_args = ['0', 0, 2, 'restinstance', 'resturl',
-                          'reqname', 1234, 'outputdata', 'sw', 'T2_US_Vanderbilt']
-        self.json_name = "jobReport.json.%s" % (self.full_args[6])
-        open(self.json_name, 'w').write(json.dumps(self.generateJobJson()))
-
-
-    def makeTempFile(self, size, pfn):
-        fh, path = tempfile.mkstemp()
-        try:
-            inputString = "CRAB3POSTJOBUNITTEST"
-            os.write(fh, (inputString * ((size/len(inputString))+1))[:size])
-            os.close(fh)
-            cmd = "env -u LD_LIBRAY_PATH lcg-cp -b -D srmv2 -v file://%s %s" % (path, pfn)
-            print(cmd)
-            status, res = commands.getstatusoutput(cmd)
-            if status:
-                exmsg = "Couldn't make file: %s" % (res)
-                raise RuntimeError(exmsg)
-        finally:
-            if os.path.exists(path):
-                os.unlink(path)
-
-
-    def getLevelOneDir(self):
-        return datetime.datetime.now().strftime("%Y-%m")
-
-    def getLevelTwoDir(self):
-        return datetime.datetime.now().strftime("%d%p")
-
-    def getUniqueFilename(self):
-        return "%s-postjob.txt" % (uuid.uuid4())
-
-    def testNonexistent(self):
-        self.full_args.extend(['/store/temp/user/meloam/CRAB3-UNITTEST-NONEXISTENT/b/c/',
-                               '/store/user/meloam/CRAB3-UNITTEST-NONEXISTENT/b/c',
-                               self.getUniqueFilename()])
-        self.assertNotEqual(self.postjob.execute(*self.full_args), 0)
-
-    source_prefix = "srm://dcache07.unl.edu:8443/srm/v2/server?SFN=/mnt/hadoop/user/uscms01/pnfs/unl.edu/data4/cms"
-    def testExistent(self):
-        source_dir  = "/store/temp/user/meloam/CRAB3-UnitTest/%s/%s" % \
-                        (self.getLevelOneDir(), self.getLevelTwoDir())
-        source_file = self.getUniqueFilename()
-        source_lfn  = "%s/%s" % (source_dir, source_file)
-        dest_dir = source_dir.replace("temp/user", "user")
-        self.makeTempFile(200, "%s/%s" %(self.source_prefix, source_lfn))
-        self.full_args.extend([source_dir, dest_dir, source_file])
-        self.assertEqual(self.postjob.execute(*self.full_args), 0)
-
-    def tearDown(self):
-        if os.path.exists(self.json_name):
-            os.unlink(self.json_name)
-
-##==============================================================================
 
 if __name__ == '__main__':
     if len(sys.argv) >= 2 and sys.argv[1] == 'UNIT_TEST':
