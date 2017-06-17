@@ -2054,9 +2054,15 @@ class PostJob():
         """
         log_and_output_files_names = [self.logs_arch_file_name] + self.output_files_names
         source_sites = []
+
         for filename in log_and_output_files_names:
             ifile = get_file_index(filename, self.output_files_info)
             source_sites.append(self.get_file_source_site(filename, ifile))
+
+            transfer = {"lfn": filename,
+                        "source": self.get_file_source_site(filename, ifile),
+                        "destination": self.dest_site}
+            json.dump(transfer, open("transfers.txt", 'a'))
 
         global ASO_JOB
         ASO_JOB = ASOServerJob(self.logger, \
