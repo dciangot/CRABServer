@@ -2055,14 +2055,37 @@ class PostJob():
         log_and_output_files_names = [self.logs_arch_file_name] + self.output_files_names
         source_sites = []
 
-        for filename in log_and_output_files_names:
-            ifile = get_file_index(filename, self.output_files_info)
-            source_sites.append(self.get_file_source_site(filename, ifile))
+        with open('transfers.txt', 'a') as transfers_file:
+            for filename in log_and_output_files_names:
+                ifile = get_file_index(filename, self.output_files_info)
+                source_sites.append(self.get_file_source_site(filename, ifile))
+                source_lfn = ""
+                dest_lfn = ""
 
-            transfer = {"lfn": filename,
-                        "source": self.get_file_source_site(filename, ifile),
-                        "destination": self.dest_site}
-            json.dump(transfer, open("transfers.txt", 'a'))
+                # TODO: niente, non puoi, sposta tutto in inject!!!
+
+                if self.transfer_logs:
+                    source_lfn = os.path.join(self.source_dir, 'log', filename)
+                    dest_lfn = os.path.join(self.dest_dir, 'log', filename)
+
+                if self.transfer_outputs:
+                    source_lfn = os.path.join(self.source_dir, filename)
+                    dest_lfn = os.path.join(self.dest_dir, filename)
+
+                self.logger.info("dumping transfer info: %s, %s, %s" % (filename,
+                                                                        self.get_file_source_site(filename, ifile),
+                                                                        self.dest_site))
+
+                transfer = {
+                    "source_lfn": source_lfn,
+                    "dest_lfn": dest_lfn,
+                    "source": self.get_file_source_site(filename, ifile),
+                    "destination": self.dest_site
+                    # TODO: ADD WHATEVER IS PASSED TO ASO_JOB
+                }
+
+                json.dump(transfer, transfers_file)
+                transfers_file.write('\n')
 
         global ASO_JOB
         ASO_JOB = ASOServerJob(self.logger, \
