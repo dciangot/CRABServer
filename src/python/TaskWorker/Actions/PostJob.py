@@ -845,7 +845,8 @@ class ASOServerJob(object):
                     returnMsg['error'] = msg
             if toTransfer:
                 with open('task_process/transfers.txt', 'a') as transfers_file:
-                    json.dump(doc, transfers_file, indent=-1)
+                    json.dump(doc, transfers_file)
+                    transfers_file.write("\n")
         else:
             returnMsg = self.couch_database.commitOne(doc)[0]
         return returnMsg
