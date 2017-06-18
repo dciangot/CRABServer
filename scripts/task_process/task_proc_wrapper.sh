@@ -4,6 +4,10 @@ function cache_status {
     python task_process/cache_status.py
 }
 
+function manage_transfers {
+    python task_process/transfer_inject.py
+}
+
 function check_exit {
     # Checks if the TP can exit without losing any possible future updates to the status of the task
     # First checks that the DAG is in a final state
@@ -48,6 +52,16 @@ if [ ! -f /etc/enable_task_daemon ]; then
     exit 1
 fi
 
+if [ ! -e task_process/fts_jobids.txt  ]; then
+        echo "task_process/fts_jobids.txt file not found, touching"
+        touch task_process/fts_jobids.txt
+fi
+
+if [ ! -e task_process/last_transfer.txt ]; then
+        echo "task_process/last_transfer.txt file not found, touching"
+        echo "0" > task_process/last_transfer.txt
+fi
+
 touch task_process/task_process_running
 echo "Starting a new task_process, creating task_process_running file"
 
@@ -81,9 +95,15 @@ do
         echo "task_process/cache_status.py file not found, exiting."
         exit 1
     fi
+    if [[ ! -f task_process/transfer_inject.py  ]]; then
+        echo "task_process/transfer_inject.py file not found, exiting."
+        exit 1
+    fi
 
+    export PYTHONPATH=$PWD/CRAB3.zip:$PYTHONPATH
     # Run the parsing script
     cache_status
+    manage_transfers
     sleep 300s
 
     # Calculate how much time has passed since the last condor_q and perform it again if it has been long enough.

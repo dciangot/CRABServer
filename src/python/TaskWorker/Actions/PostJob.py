@@ -92,7 +92,7 @@ from WMCore.Services.WMArchive.DataMap import createArchiverDoc
 from ast import literal_eval
 from TaskWorker import __version__
 from ServerUtilities import getLock
-from RESTInteractions import HTTPRequests ## Why not to use from WMCore.Services.Requests import Requests
+from RESTInteractions import HTTPRequests  ## Why not to use from WMCore.Services.Requests import Requests
 from TaskWorker.Actions.Splitter import Splitter
 from TaskWorker.Actions.RetryJob import RetryJob
 from TaskWorker.Actions.RetryJob import JOB_RETURN_CODES
@@ -744,7 +744,8 @@ class ASOServerJob(object):
                     doc.update(doc_new_info)
                     msg = "ASO job description: %s" % (pprint.pformat(doc))
                     self.logger.info(msg)
-                    commit_result_msg = self.updateOrInsertDoc(doc)
+
+                    commit_result_msg = self.updateOrInsertDoc(doc, needs_transfer)
                     if 'error' in commit_result_msg:
                         msg = "Error injecting document to ASO database:\n%s" % (commit_result_msg)
                         self.logger.info(msg)
@@ -753,6 +754,7 @@ class ASOServerJob(object):
                     self.recordASOStartTime()
                 ## Record all files for which we want the post-job to monitor their transfer.
                 if needs_transfer:
+
                     doc_info = {'doc_id'     : doc_id,
                                 'start_time' : doc.get('start_time'),
                                 'delayed_publicationflag_update' : delayed_publicationflag_update
@@ -789,7 +791,7 @@ class ASOServerJob(object):
         else:
             return self.couch_database.document(doc_id)
 
-    def updateOrInsertDoc(self, doc):
+    def updateOrInsertDoc(self, doc, toTransfer):
         """"""
         returnMsg = {}
         if not isCouchDBURL(self.aso_db_url):
@@ -841,6 +843,9 @@ class ASOServerJob(object):
                     msg += " Transfer submission failed."
                     msg += "\n%s" % (str(hte.headers))
                     returnMsg['error'] = msg
+            if toTransfer:
+                with open('task_process/transfers.txt', 'a') as transfers_file:
+                    json.dump(doc, transfers_file, indent=-1)
         else:
             returnMsg = self.couch_database.commitOne(doc)[0]
         return returnMsg
@@ -2024,6 +2029,8 @@ class PostJob():
         """
         log_and_output_files_names = [self.logs_arch_file_name] + self.output_files_names
         source_sites = []
+
+
         for filename in log_and_output_files_names:
             ifile = get_file_index(filename, self.output_files_info)
             source_sites.append(self.get_file_source_site(filename, ifile))
