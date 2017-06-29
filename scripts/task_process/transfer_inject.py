@@ -3,6 +3,7 @@
 import json
 import urllib
 import logging
+import threading
 import os
 
 import pycurl
@@ -12,7 +13,8 @@ from datetime import timedelta
 from RESTInteractions import HTTPRequests
 from ServerUtilities import  encodeRequest
 
-logging.basicConfig(filename='task_process/transfer_inject.log', level=logging.DEBUG)
+#logging.basicConfig(filename='task_process/transfer_inject.log', level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG)
 proxy = os.environ.get('X509_USER_PROXY')
 
 
@@ -51,7 +53,7 @@ def chunks(l, n):
         yield l[i:i + n]
 
 
-def mark_transferred(oracleDB, ids):
+def mark_transferred(ids):
     """
     Mark the list of files as tranferred
     :param oracleDB: oracleDB httpRequest object
@@ -59,6 +61,9 @@ def mark_transferred(oracleDB, ids):
     :return: 0 success, 1 failure
     """
     try:
+        oracleDB = HTTPRequests('asotest3.cern.ch/crabserver/dev/',
+                                proxy,
+                                proxy)
         logging.debug("Marking done %s" % ids)
 
         data = dict()
@@ -76,7 +81,7 @@ def mark_transferred(oracleDB, ids):
     return 0
 
 
-def mark_failed(oracleDB, ids, failures_reasons):
+def mark_failed(ids, failures_reasons):
     """
     Mark the list of files as failed
     :param oracleDB: oracleDB httpRequest object
@@ -84,8 +89,10 @@ def mark_failed(oracleDB, ids, failures_reasons):
     :param failures_reasons: list of strings with transfer failure messages
     :return: 0 success, 1 failure
     """
-
     try:
+        oracleDB = HTTPRequests('asotest3.cern.ch/crabserver/dev/',
+                                proxy,
+                                proxy)
         data = dict()
         data['asoworker'] = 'vocms059'
         data['subresource'] = 'updateTransfers'
@@ -103,7 +110,75 @@ def mark_failed(oracleDB, ids, failures_reasons):
     return 0
 
 
-def submit(context, toTrans):
+class submit_thread(threading.Thread):
+    """
+
+    """
+    def __init__(self, threadLock, log, context, files, source, jobids, toUpdate):
+        threading.Thread.__init__(self)
+        self.log = log
+        #self.log.info("Initializing: %s" %files)
+        self.threadLock = threadLock
+        self.files = files
+        self.source = source
+        self.jobids = jobids
+        self.context = context
+        self.toUpdate = toUpdate
+
+    def run(self):
+        """
+
+        """
+        self.threadLock.acquire()
+        self.log.info("Processing transfers from: %s" % self.source)
+
+        # create destination and source pfns for job
+        transfers = []
+        for lfn in self.files:
+            transfers.append(fts3.new_transfer(lfn[0],
+                                               lfn[1],
+                                               metadata={'oracleId': lfn[2]}
+                                               )
+                             )
+
+        self.log.info("Submitting %s transfers to FTS server" % len(self.files))
+
+        # Submit fts job
+        job = fts3.new_job(transfers,
+                           overwrite=True,
+                           verify_checksum=True,
+                           # TODO: add user DN to metadata
+                           metadata={"issuer": "ASO"},
+                           copy_pin_lifetime=-1,
+                           bring_online=None,
+                           source_spacetoken=None,
+                           spacetoken=None,
+                           max_time_in_queue=6,
+                           retry=3,
+                           retry_delay=3,
+                           reuse=True
+                           )
+        # TODO: fts retries?? check delay
+
+        jobid = fts3.submit(self.context, job)
+        self.jobids.append(jobid)
+
+        # TODO: manage exception here, what we should do?
+        fileDoc = dict()
+        fileDoc['asoworker'] = 'vocms059'
+        fileDoc['subresource'] = 'updateTransfers'
+        fileDoc['list_of_ids'] = [x[2] for x in self.files]
+        fileDoc['list_of_transfer_state'] = ["SUBMITTED" for x in self.files]
+        fileDoc['list_of_fts_instance'] = ['https://fts3.cern.ch:8446/' for x in self.files]
+        fileDoc['list_of_fts_id'] = [jobid for x in self.files]
+
+        self.log.info("Marking submitted %s files" % (len(fileDoc['list_of_ids'])))
+
+        self.toUpdate.append(fileDoc)
+        self.threadLock.release()
+
+
+def submit(context, toTrans) :
     """
     submit tranfer jobs
 
@@ -115,73 +190,37 @@ def submit(context, toTrans):
     :param toTrans: [source pfn, destination pfn, oracle file id, source site]
     :return: list of jobids submitted
     """
-    # prepare rest job with 200 files per job
+    threadLock = threading.Lock()
+    threads = []
     jobids = []
+    to_update = []
 
     oracleDB = HTTPRequests('asotest3.cern.ch/crabserver/dev/',
                             proxy,
                             proxy)
 
     sources = list(set([x[3] for x in toTrans]))
+
     for source in sources:
 
         tx_from_source = [x for x in toTrans if x[3] == source]
 
         for files in chunks(tx_from_source, 200):
-            logging.info("Processing transfers from: %s" % source)
+            thread = submit_thread(threadLock, logging, context, files, source, jobids, to_update)
+            thread.start()
+            threads.append(thread)
 
-            c = pycurl.Curl()
-            # create destination and source pfns for job
-            transfers = []
-            for lfn in files:
-                transfers.append(fts3.new_transfer(lfn[0],
-                                                   lfn[1],
-                                                   metadata={'oracleId': lfn[2]}
-                                                   )
-                                 )
-            c.close()
+    for t in threads:
+        t.join()
 
-            logging.info("Submitting %s transfers to FTS server" % len(files))
-
-            # Submit fts job
-            job = fts3.new_job(transfers,
-                               overwrite=True,
-                               verify_checksum=True,
-                               # TODO: add user DN to metadata
-                               metadata={"issuer": "ASO"},
-                               copy_pin_lifetime=-1,
-                               bring_online=None,
-                               source_spacetoken=None,
-                               spacetoken=None,
-                               max_time_in_queue=6,
-                               retry=3,
-                               retry_delay=3,
-                               reuse=True
-                               )
-            # TODO: fts retries?? check delay
-
-            jobid = fts3.submit(context, job)
-            jobids.append(jobid)
-
-            # TODO: manage exception here, what we should do?
-
-            fileDoc = dict()
-            fileDoc['asoworker'] = 'vocms059'
-            fileDoc['subresource'] = 'updateTransfers'
-            fileDoc['list_of_ids'] = [x[2] for x in files]
-            fileDoc['list_of_transfer_state'] = ["SUBMITTED" for x in files]
-            fileDoc['list_of_fts_instance'] = ['https://fts3.cern.ch:8446/' for x in files]
-            fileDoc['list_of_fts_id'] = [jobid for x in files ]
-
-            logging.info("Marking submitted %s files" % (len(fileDoc['list_of_ids'])))
-            result = oracleDB.post('filetransfers',
-                                   data=encodeRequest(fileDoc))
-            logging.info("Marked submitted %s files" % (fileDoc['list_of_ids']))
+    for fileDoc in to_update:
+        result = oracleDB.post('filetransfers',
+                                data=encodeRequest(fileDoc))
+        logging.info("Marked submitted %s files" % (fileDoc['list_of_ids']))
 
     return jobids
 
-
-def get_status(fts, jobid):
+class check_states_thread(threading.Thread):
     """
     get transfers state per jobid
 
@@ -189,65 +228,92 @@ def get_status(fts, jobid):
     - get file transfers states and get corresponding oracle ID from FTS file metadata
     - update states on oracle
 
+    :param log:
+    :param oracleDB:
     :param fts: FTS REST requesHandler
     :param jobid: fts jobid
     :return : bool for states update success or not
     """
+    def __init__(self, threadLock, log, fts, jobid, jobs_ongoing, done_id, failed_id, failed_reasons):
+        threading.Thread.__init__(self)
+        self.fts = fts
+        self.jobid = jobid
+        self.jobs_ongoing = jobs_ongoing
+        self.log = log
+        self.threadLock = threadLock
+        self.done_id = done_id
+        self.failed_id = failed_id
+        self.failed_reasons = failed_reasons
 
-    logging.info("Getting state of job %s" % (jobid))
-    # FIXME: don't work with pycurl in schedds, directly rest?
+    def run(self):
+        """
 
-    oracleDB = HTTPRequests('asotest3.cern.ch/crabserver/dev/',
-                            proxy,
-                            proxy)
+        """
+        self.threadLock.acquire()
+        self.log.info("Getting state of job %s" % (self.jobid))
 
-    done = False
-    doneReady = -1
-    failedReady = -1
-
-    status = fts.get("jobs/"+jobid)[0]
-
-    logging.info("State of job %s: %s" % (jobid, status["job_state"]))
-
-    # TODO: if in final state get with list_files=True and the update_states
-    if status["job_state"] in ['FINISHED', 'FINISHEDDIRTY', "FAILED", "CANCELED"]:
-        file_status = fts.get("jobs/%s/files" % jobid)[0]
-
-        failed_id = []
-        failed_reasons = []
-        done_id = []
-        for file_status in file_status:
-            _id = file_status['file_metadata']['oracleId']
-            tx_state = file_status['file_state']
-
-            if tx_state == 'FINISHED':
-                done_id.append(_id)
-            else:
-                failed_id.append(_id)
-                if file_status['reason']:
-                    logging.info('Failure reason: ' + file_status['reason'])
-                    failed_reasons.append(file_status['reason'])
-                else:
-                    logging.exception('Failure reason not found')
-                    failed_reasons.append('unable to get failure reason')
+        self.jobs_ongoing.append(self.jobid)
 
         try:
-            logging.info('Marking job %s files done and %s files  failed for job %s' % (len(done_id), len(failed_id), jobid))
-            if len(done_id)>0:
-                doneReady = mark_transferred(oracleDB, done_id)
-            else:
-                doneReady = 0
-            if len(failed_id)>0:
-                failedReady = mark_failed(oracleDB, failed_id, failed_reasons)
-            else:
-                failedReady = 0
-        except Exception:
-            logging.exception('Failed to update states')
+            status = self.fts.get("jobs/"+self.jobid)[0]
+        except Exception as ex:
+            self.log.exception("failed to retrieve status for %s " % self.jobid)
+            self.jobs_ongoing.append(self.jobid)
+            self.threadLock.release()
+            return
 
-    if doneReady == 0 and failedReady == 0:
-        done = True
-    return done
+        self.log.info("State of job %s: %s" % (self.jobid, status["job_state"]))
 
+        # TODO: if in final state get with list_files=True and the update_states
+        if status["job_state"] in ['FINISHED', 'FINISHEDDIRTY', "FAILED", "CANCELED"]:
+            file_status = self.fts.get("jobs/%s/files" % self.jobid)[0]
+
+            self.done_id[self.jobid] = []
+            self.failed_id[self.jobid] = []
+            self.failed_reasons[self.jobid] = []
+
+            for file_status in file_status:
+                _id = file_status['file_metadata']['oracleId']
+                tx_state = file_status['file_state']
+
+                if tx_state == 'FINISHED':
+                    self.done_id[self.jobid].append(_id)
+                else:
+                    self.failed_id[self.jobid].append(_id)
+                    if file_status['reason']:
+                        self.log.info('Failure reason: ' + file_status['reason'])
+                        self.failed_reasons[self.jobid].append(file_status['reason'])
+                    else:
+                        self.log.exception('Failure reason not found')
+                        self.failed_reasons[self.jobid].append('unable to get failure reason')
+
+        self.threadLock.release()
+
+
+class lfn2pfn_thread(threading.Thread):
+    """
+    """
+    def __init__(self, threadLock, log, data, transfers):
+        threading.Thread.__init__(self)
+        self.log = log
+        self.threadLock = threadLock
+        self.data = data
+        self.transfers = transfers
+        self.curl = pycurl.Curl()
+
+    def run(self):
+        """
+
+        """
+        pfn_source = apply_tfc_to_lfn(self.data["source"], self.data["source_lfn"], self.curl)
+        pfn_dest = apply_tfc_to_lfn(self.data["destination"], self.data["destination_lfn"], self.curl)
+        self.threadLock.acquire()
+        self.transfers.append((pfn_source, pfn_dest, self.data['id'], self.data["source"]))
+
+        #self.log.info("lfn2pfn converted for: %s" % self.data['id'] )
+
+        self.curl.close()
+        self.threadLock.release()
 
 def perform_transfers(inputFile, lastLine, _lastFile, context):
     """
@@ -257,30 +323,125 @@ def perform_transfers(inputFile, lastLine, _lastFile, context):
     :return:
     """
 
+    threadLock = threading.Lock()
+    threads = []
     transfers = []
     logging.info("starting from line: %s" % lastLine)
 
     with open(inputFile) as _list:
         for _data in _list.readlines()[lastLine:]:
-            lastLine += 1
-            data = json.loads(_data)
+            try:
+                lastLine += 1
+                data = json.loads(_data)
+            except:
+                continue
+            thread = lfn2pfn_thread(threadLock, logging, data, transfers)
+            thread.start()
+            threads.append(thread)
 
-            c = pycurl.Curl()
-            # create destination and source pfns for job
-            pfn_source = apply_tfc_to_lfn(data["source"], data["source_lfn"], c)
-            pfn_dest = apply_tfc_to_lfn(data["destination"], data["destination_lfn"], c)
-            c.close()
-            transfers.append((pfn_source, pfn_dest, data['_id'], data["source"]))
+        for t in threads:
+            t.join()
 
-        jobids = submit(context, transfers)
 
-        for jobid in jobids:
-            logging.info("Monitor link: https://fts3.cern.ch:8449/fts3/ftsmon/#/job/"+jobid)
+        jobids = []
+        if len(transfers) > 0:
+            jobids = submit(context, transfers)
+
+            for jobid in jobids:
+                logging.info("Monitor link: https://fts3.cern.ch:8449/fts3/ftsmon/#/job/"+jobid)
 
         # TODO: send to dashboard
         _lastFile.write(str(lastLine))
 
     return transfers, jobids
+
+
+def state_manager(fts):
+    """
+
+    """
+
+    threadLock = threading.Lock()
+    threads = []
+    jobs_done = []
+    jobs_ongoing = []
+    failed_id = {}
+    failed_reasons = {}
+    done_id = {}
+
+    with open("task_process/fts_jobids.txt", "r") as _jobids:
+        lines = _jobids.readlines()
+        for line in lines:
+            if line:
+                jobid = line.split('\n')[0]
+                if jobid:
+                    thread = check_states_thread(threadLock, logging, fts, jobid, jobs_ongoing, done_id, failed_id, failed_reasons)
+                    thread.start()
+                    threads.append(thread)
+        _jobids.close()
+
+    for t in threads:
+            t.join()
+
+    try:
+        for jobID, _ in done_id.iteritems():
+            doneReady = -1
+            failedReady = -1
+
+            logging.info('Marking job %s files done and %s files failed for job %s' % (len(done_id[jobID]), len(failed_id[jobID]), jobID))
+
+            print done_id[jobID]
+
+            if len(done_id[jobID])>0:
+                doneReady = mark_transferred(done_id[jobID])
+            else:
+                doneReady = 0
+            if len(failed_id[jobID])>0:
+                failedReady = mark_failed(failed_id[jobID], failed_reasons[jobID])
+            else:
+                failedReady = 0
+
+            if doneReady == 0 and failedReady == 0:
+                jobs_done.append(jobID)
+                jobs_ongoing.remove(jobID)
+            else:
+                jobs_ongoing.append(jobID)
+    except Exception:
+            logging.exception('Failed to update states')
+
+
+    with open("task_process/fts_jobids_new.txt", "w") as _jobids:
+        for line in jobs_ongoing:
+            logging.info("Writing: %s" %line)
+            _jobids.write(line+"\n")
+        _jobids.close()
+        os.rename("task_process/fts_jobids_new.txt", "task_process/fts_jobids.txt")
+
+    return jobs_ongoing
+
+
+def submission_manager(context):
+    """
+
+    """
+    with open("task_process/last_transfer.txt", "r") as _last:
+        read = _last.readline()
+        last_line = int(read)
+        logging.info("last line is: %s" % last_line)
+        _last.close()
+
+    # TODO: if the following fails check not to leave a corrupted file
+    with open("task_process/last_transfer_new.txt", "w") as _last:
+        transfers, jobids = perform_transfers("task_process/transfers.txt", last_line, _last, context)
+        _last.close()
+        os.rename("task_process/last_transfer_new.txt", "task_process/last_transfer.txt")
+
+    with open("task_process/fts_jobids.txt", "a") as _jobids:
+        for job in jobids:
+            _jobids.write(str(job)+"\n")
+        _jobids.close()
+
+    return jobids
 
 
 def algorithm():
@@ -307,41 +468,10 @@ def algorithm():
     context = fts3.Context('https://fts3.cern.ch:8446', proxy, proxy, verify=True)
     logging.info("Delegating proxy: "+fts3.delegate(context, lifetime=timedelta(hours=48), force=False))
 
-    with open("task_process/fts_jobids.txt", "r") as _jobids:
-        lines = _jobids.readlines()
-        jobs_done = []
-        jobs_ongoing = []
-        for line in lines:
-            if line:
-                jobid = line.split('\n')[0]
-                if jobid:
-                    done = get_status(fts, jobid)
-                    if done:
-                        jobs_done.append(line)
-                    else:
-                        jobs_ongoing.append(line)
-        _jobids.close()
+    jobs_ongoing = state_manager(fts)
+    new_jobs = submission_manager(context)
 
-    with open("task_process/fts_jobids.txt", "w") as _jobids:
-        for line in jobs_ongoing:
-            _jobids.write(line)
-        _jobids.close()
-
-    with open("task_process/last_transfer.txt", "r") as _last:
-        read = _last.readline()
-        last_line = int(read)
-        logging.info("last line is: %s" % last_line)
-        _last.close()
-
-    # TODO: if the following fails check not to leave a corrupted file
-    with open("task_process/last_transfer.txt", "w") as _last:
-        transfers, jobids = perform_transfers("task_process/transfers.txt", last_line, _last, context)
-        _last.close()
-
-    with open("task_process/fts_jobids.txt", "a") as _jobids:
-        for job in jobids:
-            _jobids.write(str(job)+"\n")
-        _jobids.close()
+    logging.debug("Transfer jobs ongoing: %s, %s " % (jobs_ongoing,new_jobs))
 
     # TODO: upload to oracle with fts
     # TODO: multithreading submit? https://www.tutorialspoint.com/python/python_multithreading.htm

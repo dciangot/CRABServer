@@ -792,7 +792,9 @@ class ASOServerJob(object):
             return self.couch_database.document(doc_id)
 
     def updateOrInsertDoc(self, doc, toTransfer):
-        """"""
+        """
+
+        """
         returnMsg = {}
         if not isCouchDBURL(self.aso_db_url):
             if not self.found_doc_in_db:
@@ -845,7 +847,7 @@ class ASOServerJob(object):
                     returnMsg['error'] = msg
             if toTransfer:
                 with open('task_process/transfers.txt', 'a') as transfers_file:
-                    json.dump(doc, transfers_file)
+                    json.dump(newDoc, transfers_file)
                     transfers_file.write("\n")
         else:
             returnMsg = self.couch_database.commitOne(doc)[0]
@@ -872,7 +874,7 @@ class ASOServerJob(object):
         Retrieve the status of all transfers from the cached file 'aso_status.json'
         or by querying an ASO database view if the file is more than 5 minutes old
         or if we injected a document after the file was last updated. Calls to
-+       get_transfers_statuses_fallback() have been removed to not generate load
+        get_transfers_statuses_fallback() have been removed to not generate load
         on couch.
         """
         statuses = []
@@ -1011,7 +1013,7 @@ class ASOServerJob(object):
             for doc_info in self.docs_in_transfer:
                 doc_id = doc_info['doc_id']
                 if doc_id not in aso_info.get("results", {}):
-                    msg = "Document with id %s not found in the transfer cache. Deferring PJ." % doc_id
+                    msg = "Document with id %s not found in the transfer cache: %s. Deferring PJ." % (doc_id,aso_info.get("results", {}))
                     raise TransferCacheLoadError(msg)                ## Not checking timestamps for oracle since we are not injecting from WN
                 ## and it cannot happen that condor restarts screw up things.
                 transfer_status = aso_info['results'][doc_id][0]['state']
