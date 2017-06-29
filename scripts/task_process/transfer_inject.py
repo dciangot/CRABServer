@@ -13,8 +13,7 @@ from datetime import timedelta
 from RESTInteractions import HTTPRequests
 from ServerUtilities import  encodeRequest
 
-#logging.basicConfig(filename='task_process/transfer_inject.log', level=logging.DEBUG)
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(filename='task_process/transfer_inject.log', level=logging.DEBUG)
 proxy = os.environ.get('X509_USER_PROXY')
 
 
@@ -110,14 +109,131 @@ def mark_failed(ids, failures_reasons):
     return 0
 
 
+class check_states_thread(threading.Thread):
+    """
+    get transfers state per jobid
+
+    - check if the fts job is in final state (FINISHED, FINISHEDDIRTY, CANCELED, FAILED)
+    - get file transfers states and get corresponding oracle ID from FTS file metadata
+    - update states on oracle
+    """
+    def __init__(self, threadLock, log, fts, jobid, jobs_ongoing, done_id, failed_id, failed_reasons):
+        """
+
+        :param threadLock:
+        :param log:
+        :param fts:
+        :param jobid:
+        :param jobs_ongoing:
+        :param done_id:
+        :param failed_id:
+        :param failed_reasons:
+        """
+        threading.Thread.__init__(self)
+        self.fts = fts
+        self.jobid = jobid
+        self.jobs_ongoing = jobs_ongoing
+        self.log = log
+        self.threadLock = threadLock
+        self.done_id = done_id
+        self.failed_id = failed_id
+        self.failed_reasons = failed_reasons
+
+    def run(self):
+        """
+
+        """
+        self.threadLock.acquire()
+        self.log.info("Getting state of job %s" % (self.jobid))
+
+        self.jobs_ongoing.append(self.jobid)
+
+        try:
+            status = self.fts.get("jobs/"+self.jobid)[0]
+        except Exception as ex:
+            self.log.exception("failed to retrieve status for %s " % self.jobid)
+            self.jobs_ongoing.append(self.jobid)
+            self.threadLock.release()
+            return
+
+        self.log.info("State of job %s: %s" % (self.jobid, status["job_state"]))
+
+        # TODO: if in final state get with list_files=True and the update_states
+        if status["job_state"] in ['FINISHED', 'FINISHEDDIRTY', "FAILED", "CANCELED"]:
+            file_status = self.fts.get("jobs/%s/files" % self.jobid)[0]
+
+            self.done_id[self.jobid] = []
+            self.failed_id[self.jobid] = []
+            self.failed_reasons[self.jobid] = []
+
+            for file_status in file_status:
+                _id = file_status['file_metadata']['oracleId']
+                tx_state = file_status['file_state']
+
+                if tx_state == 'FINISHED':
+                    self.done_id[self.jobid].append(_id)
+                else:
+                    self.failed_id[self.jobid].append(_id)
+                    if file_status['reason']:
+                        self.log.info('Failure reason: ' + file_status['reason'])
+                        self.failed_reasons[self.jobid].append(file_status['reason'])
+                    else:
+                        self.log.exception('Failure reason not found')
+                        self.failed_reasons[self.jobid].append('unable to get failure reason')
+
+        self.threadLock.release()
+
+
+class lfn2pfn_thread(threading.Thread):
+    """
+    """
+    def __init__(self, threadLock, log, data, transfers):
+        """
+
+        :param threadLock:
+        :param log:
+        :param data:
+        :param transfers:
+        """
+        threading.Thread.__init__(self)
+        self.log = log
+        self.threadLock = threadLock
+        self.data = data
+        self.transfers = transfers
+        self.curl = pycurl.Curl()
+
+    def run(self):
+        """
+
+        """
+        pfn_source = apply_tfc_to_lfn(self.data["source"], self.data["source_lfn"], self.curl)
+        pfn_dest = apply_tfc_to_lfn(self.data["destination"], self.data["destination_lfn"], self.curl)
+        self.threadLock.acquire()
+        self.transfers.append((pfn_source, pfn_dest, self.data['id'], self.data["source"]))
+
+        #self.log.info("lfn2pfn converted for: %s" % self.data['id'] )
+
+        self.curl.close()
+        self.threadLock.release()
+
+
 class submit_thread(threading.Thread):
     """
 
     """
     def __init__(self, threadLock, log, context, files, source, jobids, toUpdate):
+        """
+
+        :param threadLock:
+        :param log:
+        :param context:
+        :param files:
+        :param source:
+        :param jobids:
+        :param toUpdate:
+        """
         threading.Thread.__init__(self)
         self.log = log
-        #self.log.info("Initializing: %s" %files)
         self.threadLock = threadLock
         self.files = files
         self.source = source
@@ -214,106 +330,12 @@ def submit(context, toTrans) :
         t.join()
 
     for fileDoc in to_update:
-        result = oracleDB.post('filetransfers',
-                                data=encodeRequest(fileDoc))
+        _ = oracleDB.post('filetransfers',
+                          data=encodeRequest(fileDoc))
         logging.info("Marked submitted %s files" % (fileDoc['list_of_ids']))
 
     return jobids
 
-class check_states_thread(threading.Thread):
-    """
-    get transfers state per jobid
-
-    - check if the fts job is in final state (FINISHED, FINISHEDDIRTY, CANCELED, FAILED)
-    - get file transfers states and get corresponding oracle ID from FTS file metadata
-    - update states on oracle
-
-    :param log:
-    :param oracleDB:
-    :param fts: FTS REST requesHandler
-    :param jobid: fts jobid
-    :return : bool for states update success or not
-    """
-    def __init__(self, threadLock, log, fts, jobid, jobs_ongoing, done_id, failed_id, failed_reasons):
-        threading.Thread.__init__(self)
-        self.fts = fts
-        self.jobid = jobid
-        self.jobs_ongoing = jobs_ongoing
-        self.log = log
-        self.threadLock = threadLock
-        self.done_id = done_id
-        self.failed_id = failed_id
-        self.failed_reasons = failed_reasons
-
-    def run(self):
-        """
-
-        """
-        self.threadLock.acquire()
-        self.log.info("Getting state of job %s" % (self.jobid))
-
-        self.jobs_ongoing.append(self.jobid)
-
-        try:
-            status = self.fts.get("jobs/"+self.jobid)[0]
-        except Exception as ex:
-            self.log.exception("failed to retrieve status for %s " % self.jobid)
-            self.jobs_ongoing.append(self.jobid)
-            self.threadLock.release()
-            return
-
-        self.log.info("State of job %s: %s" % (self.jobid, status["job_state"]))
-
-        # TODO: if in final state get with list_files=True and the update_states
-        if status["job_state"] in ['FINISHED', 'FINISHEDDIRTY', "FAILED", "CANCELED"]:
-            file_status = self.fts.get("jobs/%s/files" % self.jobid)[0]
-
-            self.done_id[self.jobid] = []
-            self.failed_id[self.jobid] = []
-            self.failed_reasons[self.jobid] = []
-
-            for file_status in file_status:
-                _id = file_status['file_metadata']['oracleId']
-                tx_state = file_status['file_state']
-
-                if tx_state == 'FINISHED':
-                    self.done_id[self.jobid].append(_id)
-                else:
-                    self.failed_id[self.jobid].append(_id)
-                    if file_status['reason']:
-                        self.log.info('Failure reason: ' + file_status['reason'])
-                        self.failed_reasons[self.jobid].append(file_status['reason'])
-                    else:
-                        self.log.exception('Failure reason not found')
-                        self.failed_reasons[self.jobid].append('unable to get failure reason')
-
-        self.threadLock.release()
-
-
-class lfn2pfn_thread(threading.Thread):
-    """
-    """
-    def __init__(self, threadLock, log, data, transfers):
-        threading.Thread.__init__(self)
-        self.log = log
-        self.threadLock = threadLock
-        self.data = data
-        self.transfers = transfers
-        self.curl = pycurl.Curl()
-
-    def run(self):
-        """
-
-        """
-        pfn_source = apply_tfc_to_lfn(self.data["source"], self.data["source_lfn"], self.curl)
-        pfn_dest = apply_tfc_to_lfn(self.data["destination"], self.data["destination_lfn"], self.curl)
-        self.threadLock.acquire()
-        self.transfers.append((pfn_source, pfn_dest, self.data['id'], self.data["source"]))
-
-        #self.log.info("lfn2pfn converted for: %s" % self.data['id'] )
-
-        self.curl.close()
-        self.threadLock.release()
 
 def perform_transfers(inputFile, lastLine, _lastFile, context):
     """
@@ -342,7 +364,6 @@ def perform_transfers(inputFile, lastLine, _lastFile, context):
         for t in threads:
             t.join()
 
-
         jobids = []
         if len(transfers) > 0:
             jobids = submit(context, transfers)
@@ -360,7 +381,6 @@ def state_manager(fts):
     """
 
     """
-
     threadLock = threading.Lock()
     threads = []
     jobs_done = []
@@ -385,18 +405,15 @@ def state_manager(fts):
 
     try:
         for jobID, _ in done_id.iteritems():
-            doneReady = -1
-            failedReady = -1
-
             logging.info('Marking job %s files done and %s files failed for job %s' % (len(done_id[jobID]), len(failed_id[jobID]), jobID))
 
             print done_id[jobID]
 
-            if len(done_id[jobID])>0:
+            if len(done_id[jobID]) > 0:
                 doneReady = mark_transferred(done_id[jobID])
             else:
                 doneReady = 0
-            if len(failed_id[jobID])>0:
+            if len(failed_id[jobID]) > 0:
                 failedReady = mark_failed(failed_id[jobID], failed_reasons[jobID])
             else:
                 failedReady = 0
@@ -408,7 +425,6 @@ def state_manager(fts):
                 jobs_ongoing.append(jobID)
     except Exception:
             logging.exception('Failed to update states')
-
 
     with open("task_process/fts_jobids_new.txt", "w") as _jobids:
         for line in jobs_ongoing:
@@ -456,8 +472,6 @@ def algorithm():
         + submit ftsjob and save fts jobid
         + update info in oracle
     - append new fts job ids to fts_jobids.txt
-
-    :return:
     """
 
     # TODO: pass by configuration
