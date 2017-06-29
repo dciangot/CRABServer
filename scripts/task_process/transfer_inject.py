@@ -18,7 +18,7 @@ from ServerUtilities import  encodeRequest
 logging.basicConfig(
     filename='task_process/transfer_inject.log',
     level=logging.DEBUG,
-    format='%(relativeCreated)6d %(threadName)s %(message)s'
+    format='%(asctime)s[%(relativeCreated)6d]%(threadName)s: %(message)s'
 )
 
 proxy = os.environ.get('X509_USER_PROXY')
