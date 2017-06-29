@@ -1,5 +1,7 @@
 #!/usr/bin/python
+"""
 
+"""
 import json
 import urllib
 import logging
@@ -487,9 +489,6 @@ def algorithm():
     new_jobs = submission_manager(context)
 
     logging.debug("Transfer jobs ongoing: %s, %s " % (jobs_ongoing,new_jobs))
-
-    # TODO: upload to oracle with fts
-    # TODO: multithreading submit? https://www.tutorialspoint.com/python/python_multithreading.htm
 
     return
 
