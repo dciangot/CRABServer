@@ -13,7 +13,12 @@ from datetime import timedelta
 from RESTInteractions import HTTPRequests
 from ServerUtilities import  encodeRequest
 
-logging.basicConfig(filename='task_process/transfer_inject.log', level=logging.DEBUG)
+logging.basicConfig(
+    filename='task_process/transfer_inject.log',
+    level=logging.DEBUG,
+    format='%(relativeCreated)6d %(threadName)s %(message)s'
+)
+
 proxy = os.environ.get('X509_USER_PROXY')
 
 
@@ -112,10 +117,6 @@ def mark_failed(ids, failures_reasons):
 class check_states_thread(threading.Thread):
     """
     get transfers state per jobid
-
-    - check if the fts job is in final state (FINISHED, FINISHEDDIRTY, CANCELED, FAILED)
-    - get file transfers states and get corresponding oracle ID from FTS file metadata
-    - update states on oracle
     """
     def __init__(self, threadLock, log, fts, jobid, jobs_ongoing, done_id, failed_id, failed_reasons):
         """
@@ -141,7 +142,9 @@ class check_states_thread(threading.Thread):
 
     def run(self):
         """
-
+        - check if the fts job is in final state (FINISHED, FINISHEDDIRTY, CANCELED, FAILED)
+        - get file transfers states and get corresponding oracle ID from FTS file metadata
+        - update states on oracle
         """
         self.threadLock.acquire()
         self.log.info("Getting state of job %s" % (self.jobid))
@@ -406,8 +409,6 @@ def state_manager(fts):
     try:
         for jobID, _ in done_id.iteritems():
             logging.info('Marking job %s files done and %s files failed for job %s' % (len(done_id[jobID]), len(failed_id[jobID]), jobID))
-
-            print done_id[jobID]
 
             if len(done_id[jobID]) > 0:
                 doneReady = mark_transferred(done_id[jobID])
