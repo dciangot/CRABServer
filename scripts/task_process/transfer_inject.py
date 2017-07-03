@@ -3,13 +3,9 @@
 
 """
 import json
-import urllib
 import logging
 import threading
 import os
-
-import pycurl
-from io import BytesIO
 
 from WMCore.Services.PhEDEx.PhEDEx import PhEDEx
 from WMCore.Storage.TrivialFileCatalog import readTFC
