@@ -849,8 +849,9 @@ class ASOServerJob(object):
                     returnMsg['error'] = msg
             if toTransfer:
                 with open('task_process/transfers.txt', 'a') as transfers_file:
-                    json.dump(newDoc, transfers_file)
-                    transfers_file.write("\n")
+                    transfer_dump = json.dumps(newDoc)
+                    transfers_file.write(transfer_dump+"\n")
+                    transfers_file.close()
         else:
             returnMsg = self.couch_database.commitOne(doc)[0]
         return returnMsg
@@ -2876,13 +2877,6 @@ class testServer(unittest.TestCase):
 
 
     def setUp(self):
-        self.postjob = PostJob()
-        #self.job = ASOServerJob()
-        #status, crab_retry, max_retries, restinstance, resturl, reqname, id,
-        #outputdata, job_sw, async_dest, source_dir, dest_dir, *filenames
-        self.full_args = ['0', 0, 2, 'restinstance', 'resturl',
-                          'reqname', 1234, 'outputdata', 'sw', 'T2_US_Vanderbilt']
-        self.json_name = "jobReport.json.%s" % (self.full_args[6])
         open(self.json_name, 'w').write(json.dumps(self.generateJobJson()))
 
 

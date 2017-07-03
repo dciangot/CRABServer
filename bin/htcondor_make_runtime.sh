@@ -108,6 +108,8 @@ else
     tar xzf cherrypy.tar.gz || exit 2
     tar xzf nose.tar.gz || exit 2
 
+    zip -rq $STARTDIR/CRAB3.zip fts3  -x \*.pyc || exit 3
+
     pushd CherryPy-3.1.2/
     zip -rq $STARTDIR/CRAB3.zip cherrypy  -x \*.pyc || exit 3
     popd
@@ -135,7 +137,7 @@ fi
 
 pwd
 echo "Making TaskManagerRun tarball"
-tar zcf $ORIGDIR/TaskManagerRun-$CRAB3_VERSION.tar.gz CRAB3.zip TweakPSet.py CMSRunAnalysis.py ApmonIf.py task_process DashboardAPI.py Logger.py ProcInfo.py apmon.py ServerUtilities.py CMSGroupMapper.py RESTInteractions.py libcurl.so.4 || exit 4
+tar zcf $ORIGDIR/TaskManagerRun-$CRAB3_VERSION.tar.gz CRAB3.zip TweakPSet.py CMSRunAnalysis.py ApmonIf.py task_process fts3 DashboardAPI.py Logger.py ProcInfo.py apmon.py ServerUtilities.py CMSGroupMapper.py RESTInteractions.py libcurl.so.4 || exit 4
 echo "Making CMSRunAnalysis tarball"
 tar zcf $ORIGDIR/CMSRunAnalysis-$CRAB3_VERSION.tar.gz WMCore.zip TweakPSet.py CMSRunAnalysis.py ApmonIf.py DashboardAPI.py Logger.py ProcInfo.py apmon.py ServerUtilities.py CMSGroupMapper.py RESTInteractions.py DashboardFailure.sh libcurl.so.4 || exit 4
 popd

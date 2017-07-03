@@ -149,17 +149,15 @@ class check_states_thread(threading.Thread):
         - update states on oracle
         """
 
+        self.threadLock.acquire()
         self.log.info("Getting state of job %s" % self.jobid)
 
-        self.threadLock.acquire()
         self.jobs_ongoing.append(self.jobid)
-        self.threadLock.release()
 
         try:
             status = self.fts.get("jobs/"+self.jobid)[0]
         except Exception as ex:
             self.log.exception("failed to retrieve status for %s " % self.jobid)
-            self.threadLock.acquire()
             self.jobs_ongoing.append(self.jobid)
             self.threadLock.release()
             return
@@ -178,7 +176,6 @@ class check_states_thread(threading.Thread):
                 _id = file_status['file_metadata']['oracleId']
                 tx_state = file_status['file_state']
 
-                self.threadLock.acquire()
                 if tx_state == 'FINISHED':
                     self.done_id[self.jobid].append(_id)
                 else:
@@ -190,7 +187,7 @@ class check_states_thread(threading.Thread):
                         self.log.exception('Failure reason not found')
                         self.failed_reasons[self.jobid].append('unable to get failure reason')
 
-                self.threadLock.release()
+        self.threadLock.release()
 
 
 class lfn2pfn_thread(threading.Thread):
@@ -253,6 +250,8 @@ class submit_thread(threading.Thread):
         """
 
         """
+
+        self.threadLock.acquire()
         self.log.info("Processing transfers from: %s" % self.source)
 
         # create destination and source pfns for job
@@ -263,7 +262,6 @@ class submit_thread(threading.Thread):
                                                metadata={'oracleId': lfn[2]}
                                                )
                              )
-
         self.log.info("Submitting %s transfers to FTS server" % len(self.files))
 
         # Submit fts job
@@ -285,9 +283,7 @@ class submit_thread(threading.Thread):
 
         jobid = fts3.submit(self.context, job)
 
-        self.threadLock.acquire()
         self.jobids.append(jobid)
-        self.threadLock.release()
 
         # TODO: manage exception here, what we should do?
         fileDoc = dict()
@@ -300,7 +296,6 @@ class submit_thread(threading.Thread):
 
         self.log.info("Marking submitted %s files" % (len(fileDoc['list_of_ids'])))
 
-        self.threadLock.acquire()
         self.toUpdate.append(fileDoc)
         self.threadLock.release()
 
