@@ -10,6 +10,9 @@ import os
 
 import pycurl
 from io import BytesIO
+
+from WMCore.Services.PhEDEx.PhEDEx import PhEDEx
+from WMCore.Storage.TrivialFileCatalog import readTFC
 import fts3.rest.client.easy as fts3
 from datetime import timedelta
 from RESTInteractions import HTTPRequests
@@ -24,6 +27,23 @@ logging.basicConfig(
 proxy = os.environ.get('X509_USER_PROXY')
 
 
+def get_tfc_rules(phedex, site):
+    """
+    Get the TFC regexp for a given site.
+    """
+    tfc_file = None
+    try:
+        phedex.getNodeTFC(site)
+    except Exception as e:
+        logging.exception('PhEDEx exception: %s' % e)
+    try:
+        tfc_file = phedex.cacheFileName('tfc',
+                                        inputdata={'node': site})
+    except Exception as e:
+        logging.exception('PhEDEx cache exception: %s' % e)
+    return readTFC(tfc_file)
+
+
 def apply_tfc_to_lfn(site, lfn, c):
     """
     Take a CMS_NAME:lfn string and make a pfn.
@@ -36,6 +56,8 @@ def apply_tfc_to_lfn(site, lfn, c):
 
     # curl https://cmsweb.cern.ch/phedex/datasvc/json/prod/tfc?node=site
     # TODO: cache the tfc rules
+    #     return pfn = tfc_map[site].matchLFN('srmv2', lfn)
+
     input_dict = {'node': site, 'lfn': lfn, 'protocol': "srmv2", 'custodial': 'n'}
     c.setopt(c.URL, 'https://cmsweb.cern.ch/phedex/datasvc/json/prod/lfn2pfn?'+urllib.urlencode(input_dict))
     e = BytesIO()
@@ -62,7 +84,6 @@ def chunks(l, n):
 def mark_transferred(ids):
     """
     Mark the list of files as tranferred
-    :param oracleDB: oracleDB httpRequest object
     :param ids: list of Oracle file ids to update
     :return: 0 success, 1 failure
     """
@@ -90,7 +111,6 @@ def mark_transferred(ids):
 def mark_failed(ids, failures_reasons):
     """
     Mark the list of files as failed
-    :param oracleDB: oracleDB httpRequest object
     :param ids: list of Oracle file ids to update
     :param failures_reasons: list of strings with transfer failure messages
     :return: 0 success, 1 failure
@@ -190,38 +210,6 @@ class check_states_thread(threading.Thread):
         self.threadLock.release()
 
 
-class lfn2pfn_thread(threading.Thread):
-    """
-    """
-    def __init__(self, threadLock, log, data, transfers):
-        """
-
-        :param threadLock:
-        :param log:
-        :param data:
-        :param transfers:
-        """
-        threading.Thread.__init__(self)
-        self.log = log
-        self.threadLock = threadLock
-        self.data = data
-        self.transfers = transfers
-        self.curl = pycurl.Curl()
-
-    def run(self):
-        """
-
-        """
-        pfn_source = apply_tfc_to_lfn(self.data["source"], self.data["source_lfn"], self.curl)
-        pfn_dest = apply_tfc_to_lfn(self.data["destination"], self.data["destination_lfn"], self.curl)
-        self.threadLock.acquire()
-        self.transfers.append((pfn_source, pfn_dest, self.data['id'], self.data["source"]))
-
-        #self.log.info("lfn2pfn converted for: %s" % self.data['id'] )
-        self.threadLock.release()
-        self.curl.close()
-
-
 class submit_thread(threading.Thread):
     """
 
@@ -300,7 +288,7 @@ class submit_thread(threading.Thread):
         self.threadLock.release()
 
 
-def submit(context, toTrans) :
+def submit(phedex, context, toTrans):
     """
     submit tranfer jobs
 
@@ -322,10 +310,14 @@ def submit(context, toTrans) :
                             proxy)
 
     sources = list(set([x[3] for x in toTrans]))
+    dest_tfc_map = get_tfc_rules(phedex, toTrans[0][4])
 
     for source in sources:
+        source_tfc_map = get_tfc_rules(phedex, source)
 
-        tx_from_source = [x for x in toTrans if x[3] == source]
+        tx_from_source = [[source_tfc_map.matchLFN('srmv2', x[0]),
+                           dest_tfc_map.matchLFN('srmv2', x[1]),
+                           x[2], x[3]] for x in toTrans if x[3] == source]
 
         for files in chunks(tx_from_source, 200):
             thread = submit_thread(threadLock, logging, context, files, source, jobids, to_update)
@@ -343,7 +335,7 @@ def submit(context, toTrans) :
     return jobids
 
 
-def perform_transfers(inputFile, lastLine, _lastFile, context):
+def perform_transfers(inputFile, lastLine, _lastFile, context, phedex):
     """
     get transfers and update last read line number
     :param inputFile:
@@ -358,21 +350,16 @@ def perform_transfers(inputFile, lastLine, _lastFile, context):
 
     with open(inputFile) as _list:
         for _data in _list.readlines()[lastLine:]:
-            try:
-                lastLine += 1
-                data = json.loads(_data)
-            except:
-                continue
-            thread = lfn2pfn_thread(threadLock, logging, data, transfers)
-            thread.start()
-            threads.append(thread)
-
-        for t in threads:
-            t.join()
+            doc = json.loads(_data)
+            transfers.append([doc["source_lfn"],
+                              doc["destination_lfn"],
+                              doc["id"],
+                              doc["source"],
+                              doc["destination"]])
 
         jobids = []
         if len(transfers) > 0:
-            jobids = submit(context, transfers)
+            jobids = submit(phedex, context, transfers)
 
             for jobid in jobids:
                 logging.info("Monitor link: https://fts3.cern.ch:8449/fts3/ftsmon/#/job/"+jobid)
@@ -440,7 +427,7 @@ def state_manager(fts):
     return jobs_ongoing
 
 
-def submission_manager(context):
+def submission_manager(phedex, context):
     """
 
     """
@@ -452,7 +439,7 @@ def submission_manager(context):
 
     # TODO: if the following fails check not to leave a corrupted file
     with open("task_process/last_transfer_new.txt", "w") as _last:
-        transfers, jobids = perform_transfers("task_process/transfers.txt", last_line, _last, context)
+        transfers, jobids = perform_transfers("task_process/transfers.txt", last_line, _last, context, phedex)
         _last.close()
         os.rename("task_process/last_transfer_new.txt", "task_process/last_transfer.txt")
 
@@ -486,8 +473,16 @@ def algorithm():
     context = fts3.Context('https://fts3.cern.ch:8446', proxy, proxy, verify=True)
     logging.info("Delegating proxy: "+fts3.delegate(context, lifetime=timedelta(hours=48), force=False))
 
+    try:
+        phedex = PhEDEx(responseType='json',
+                        dict={'key': proxy,
+                              'cert': proxy})
+    except Exception as e:
+        logging.exception('PhEDEx exception: %s' % e)
+        return
+
     jobs_ongoing = state_manager(fts)
-    new_jobs = submission_manager(context)
+    new_jobs = submission_manager(phedex, context)
 
     logging.debug("Transfer jobs ongoing: %s, %s " % (jobs_ongoing,new_jobs))
 
