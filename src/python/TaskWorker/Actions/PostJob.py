@@ -831,8 +831,6 @@ class ASOServerJob(object):
                           'start_time': self.aso_start_timestamp,
                           'source': doc['source'],
                           'source_lfn': doc['source_lfn'],
-                          'destination': doc['destination'],
-                          'destination_lfn': doc['destination_lfn'],
                           'filesize': doc['filesize'],
                           'transfer_state': doc.get('state', 'NEW').upper(),
                           'publication_state': 'NEW' if doc['publish'] else 'NOT_REQUIRED',
@@ -842,6 +840,8 @@ class ASOServerJob(object):
                           'subresource': 'updateDoc'}
                 try:
                     self.server.post(self.rest_uri_file_user_transfers, data=encodeRequest(newDoc))
+                    newDoc['destination'] = doc['destination']
+                    newDoc['destination_lfn'] = doc['destination_lfn']
                 except HTTPException as hte:
                     msg  = "Error updating document in database."
                     msg += " Transfer submission failed."
