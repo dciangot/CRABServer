@@ -44,32 +44,6 @@ def get_tfc_rules(phedex, site):
     return readTFC(tfc_file)
 
 
-def apply_tfc_to_lfn(site, lfn, c):
-    """
-    Take a CMS_NAME:lfn string and make a pfn.
-
-    :param site: site name
-    :param lfn:
-    :param c: curl session
-    :return: pfn
-    """
-
-    # curl https://cmsweb.cern.ch/phedex/datasvc/json/prod/tfc?node=site
-    # TODO: cache the tfc rules
-    #     return pfn = tfc_map[site].matchLFN('srmv2', lfn)
-
-    input_dict = {'node': site, 'lfn': lfn, 'protocol': "srmv2", 'custodial': 'n'}
-    c.setopt(c.URL, 'https://cmsweb.cern.ch/phedex/datasvc/json/prod/lfn2pfn?'+urllib.urlencode(input_dict))
-    e = BytesIO()
-    c.setopt(pycurl.WRITEFUNCTION, e.write)
-    c.perform()
-    # print(e.getvalue().decode('UTF-8'))
-    results = json.loads(e.getvalue().decode('UTF-8'))
-
-    e.close()
-    return results["phedex"]["mapping"][0]["pfn"]
-
-
 def chunks(l, n):
     """
     Yield successive n-sized chunks from l.
@@ -350,7 +324,11 @@ def perform_transfers(inputFile, lastLine, _lastFile, context, phedex):
 
     with open(inputFile) as _list:
         for _data in _list.readlines()[lastLine:]:
-            doc = json.loads(_data)
+            try:
+                lastLine += 1
+                doc = json.loads(_data)
+            except:
+                continue
             transfers.append([doc["source_lfn"],
                               doc["destination_lfn"],
                               doc["id"],
@@ -474,7 +452,7 @@ def algorithm():
     logging.info("Delegating proxy: "+fts3.delegate(context, lifetime=timedelta(hours=48), force=False))
 
     try:
-        phedex = PhEDEx(responseType='json',
+        phedex = PhEDEx(responseType='xml',
                         dict={'key': proxy,
                               'cert': proxy})
     except Exception as e:
