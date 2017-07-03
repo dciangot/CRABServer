@@ -76,7 +76,7 @@ def mark_transferred(ids):
         data['asoworker'] = 'vocms059'
         data['subresource'] = 'updateTransfers'
         data['list_of_ids'] = ids
-        data['list_of_transfer_state'] = ["DONE" for x in ids]
+        data['list_of_transfer_state'] = ["DONE" for _ in ids]
 
         oracleDB.post('filetransfers',
                       data=encodeRequest(data))
@@ -148,15 +148,18 @@ class check_states_thread(threading.Thread):
         - get file transfers states and get corresponding oracle ID from FTS file metadata
         - update states on oracle
         """
-        self.threadLock.acquire()
-        self.log.info("Getting state of job %s" % (self.jobid))
 
+        self.log.info("Getting state of job %s" % self.jobid)
+
+        self.threadLock.acquire()
         self.jobs_ongoing.append(self.jobid)
+        self.threadLock.release()
 
         try:
             status = self.fts.get("jobs/"+self.jobid)[0]
         except Exception as ex:
             self.log.exception("failed to retrieve status for %s " % self.jobid)
+            self.threadLock.acquire()
             self.jobs_ongoing.append(self.jobid)
             self.threadLock.release()
             return
@@ -175,6 +178,7 @@ class check_states_thread(threading.Thread):
                 _id = file_status['file_metadata']['oracleId']
                 tx_state = file_status['file_state']
 
+                self.threadLock.acquire()
                 if tx_state == 'FINISHED':
                     self.done_id[self.jobid].append(_id)
                 else:
@@ -186,7 +190,7 @@ class check_states_thread(threading.Thread):
                         self.log.exception('Failure reason not found')
                         self.failed_reasons[self.jobid].append('unable to get failure reason')
 
-        self.threadLock.release()
+                self.threadLock.release()
 
 
 class lfn2pfn_thread(threading.Thread):
@@ -217,9 +221,8 @@ class lfn2pfn_thread(threading.Thread):
         self.transfers.append((pfn_source, pfn_dest, self.data['id'], self.data["source"]))
 
         #self.log.info("lfn2pfn converted for: %s" % self.data['id'] )
-
-        self.curl.close()
         self.threadLock.release()
+        self.curl.close()
 
 
 class submit_thread(threading.Thread):
@@ -250,7 +253,6 @@ class submit_thread(threading.Thread):
         """
 
         """
-        self.threadLock.acquire()
         self.log.info("Processing transfers from: %s" % self.source)
 
         # create destination and source pfns for job
@@ -282,19 +284,23 @@ class submit_thread(threading.Thread):
         # TODO: fts retries?? check delay
 
         jobid = fts3.submit(self.context, job)
+
+        self.threadLock.acquire()
         self.jobids.append(jobid)
+        self.threadLock.release()
 
         # TODO: manage exception here, what we should do?
         fileDoc = dict()
         fileDoc['asoworker'] = 'vocms059'
         fileDoc['subresource'] = 'updateTransfers'
         fileDoc['list_of_ids'] = [x[2] for x in self.files]
-        fileDoc['list_of_transfer_state'] = ["SUBMITTED" for x in self.files]
-        fileDoc['list_of_fts_instance'] = ['https://fts3.cern.ch:8446/' for x in self.files]
-        fileDoc['list_of_fts_id'] = [jobid for x in self.files]
+        fileDoc['list_of_transfer_state'] = ["SUBMITTED" for _ in self.files]
+        fileDoc['list_of_fts_instance'] = ['https://fts3.cern.ch:8446/' for _ in self.files]
+        fileDoc['list_of_fts_id'] = [jobid for _ in self.files]
 
         self.log.info("Marking submitted %s files" % (len(fileDoc['list_of_ids'])))
 
+        self.threadLock.acquire()
         self.toUpdate.append(fileDoc)
         self.threadLock.release()
 

@@ -831,6 +831,8 @@ class ASOServerJob(object):
                           'start_time': self.aso_start_timestamp,
                           'source': doc['source'],
                           'source_lfn': doc['source_lfn'],
+                          'destination': doc['destination'],
+                          'destination_lfn': doc['destination_lfn'],
                           'filesize': doc['filesize'],
                           'transfer_state': doc.get('state', 'NEW').upper(),
                           'publication_state': 'NEW' if doc['publish'] else 'NOT_REQUIRED',
