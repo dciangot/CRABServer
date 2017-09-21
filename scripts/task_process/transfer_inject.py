@@ -338,7 +338,8 @@ def perform_transfers(inputFile, lastLine, _lastFile, context, phedex):
             for jobid in jobids:
                 logging.info("Monitor link: https://fts3.cern.ch:8449/fts3/ftsmon/#/job/"+jobid)
 
-        # TODO: send to dashboard
+            # TODO: send to dashboard
+
         _lastFile.write(str(lastLine))
 
     return transfers, jobids
