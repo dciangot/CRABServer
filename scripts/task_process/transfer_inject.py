@@ -15,7 +15,7 @@ from RESTInteractions import HTTPRequests
 from ServerUtilities import  encodeRequest
 
 logging.basicConfig(
-    filename='task_process/transfer_inject.log',
+    filename='task_process/transfers/transfer_inject.log',
     level=logging.DEBUG,
     format='%(asctime)s[%(relativeCreated)6d]%(threadName)s: %(message)s'
 )
@@ -357,7 +357,7 @@ def state_manager(fts):
     failed_reasons = {}
     done_id = {}
 
-    with open("task_process/fts_jobids.txt", "r") as _jobids:
+    with open("task_process/transfers/fts_jobids.txt", "r") as _jobids:
         lines = _jobids.readlines()
         for line in lines:
             if line:
@@ -392,12 +392,12 @@ def state_manager(fts):
     except Exception:
             logging.exception('Failed to update states')
 
-    with open("task_process/fts_jobids_new.txt", "w") as _jobids:
+    with open("task_process/transfers/fts_jobids_new.txt", "w") as _jobids:
         for line in jobs_ongoing:
             logging.info("Writing: %s" %line)
             _jobids.write(line+"\n")
         _jobids.close()
-        os.rename("task_process/fts_jobids_new.txt", "task_process/fts_jobids.txt")
+        os.rename("task_process/transfers/fts_jobids_new.txt", "task_process/transfers/fts_jobids.txt")
 
     return jobs_ongoing
 
@@ -406,19 +406,19 @@ def submission_manager(phedex, context):
     """
 
     """
-    with open("task_process/last_transfer.txt", "r") as _last:
+    with open("task_process/transfers/last_transfer.txt", "r") as _last:
         read = _last.readline()
         last_line = int(read)
         logging.info("last line is: %s" % last_line)
         _last.close()
 
     # TODO: if the following fails check not to leave a corrupted file
-    with open("task_process/last_transfer_new.txt", "w") as _last:
-        transfers, jobids = perform_transfers("task_process/transfers.txt", last_line, _last, context, phedex)
+    with open("task_process/transfers/last_transfer_new.txt", "w") as _last:
+        transfers, jobids = perform_transfers("task_process/transfers/transfers.txt", last_line, _last, context, phedex)
         _last.close()
-        os.rename("task_process/last_transfer_new.txt", "task_process/last_transfer.txt")
+        os.rename("task_process/transfers/last_transfer_new.txt", "task_process/transfers/last_transfer.txt")
 
-    with open("task_process/fts_jobids.txt", "a") as _jobids:
+    with open("task_process/transfers/fts_jobids.txt", "a") as _jobids:
         for job in jobids:
             _jobids.write(str(job)+"\n")
         _jobids.close()
@@ -446,7 +446,7 @@ def algorithm():
                         proxy)
 
     context = fts3.Context('https://fts3.cern.ch:8446', proxy, proxy, verify=True)
-    logging.info("Delegating proxy: "+fts3.delegate(context, lifetime=timedelta(hours=48), force=False))
+    logging.debug("Delegating proxy: "+fts3.delegate(context, lifetime=timedelta(hours=48), force=False))
 
     try:
         phedex = PhEDEx(responseType='xml',
@@ -464,6 +464,7 @@ def algorithm():
     return
 
 if __name__ == "__main__":
+    os.makedirs('task_process/transfers')
     try:
         algorithm()
     except Exception:
