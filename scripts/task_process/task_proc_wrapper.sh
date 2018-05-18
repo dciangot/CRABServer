@@ -1,17 +1,15 @@
 #!/bin/bash
 
-function log {
-    echo "[$(date +"%F %R")]" $*
-}
-
 function cache_status {
-    log "Running cache_status.py"
     python task_process/cache_status.py
 }
 
-function exit_now {
+function manage_transfers {
+    python task_process/transfer_inject.py
+}
+
+function check_exit {
     # Checks if the TP can exit without losing any possible future updates to the status of the task
-    # Returns a string "True" or "False"
     # First checks that the DAG is in a final state
     # If that passes, checks if the dag has been in a final state for long enough (currently 24h)
     # It will echo 1 if TP can exit, otherwise 0
@@ -21,51 +19,58 @@ function exit_now {
     # (DAG_INFO is not "init") and if the last perfomed condor_q was
     # successfull (DAG_INFO is not empty)
     if [[ "$DAG_INFO" == "init" || ! "$DAG_INFO" ]]; then
-        EXIT_NOW=False
-        echo $EXIT_NOW
+        echo 0
         return
     fi
 
     # Make sure that all DAGs have exited; Count the ones that are still
     # running or are in the current state for less than 24 hours.
-    EXIT_NOW=True
-    ONE_DAY=$(( 24 * 3600 ))
-    while read CLUSTER_ID DAG_STATUS ENTERED_CUR_STATUS; do
-        TIME_IN_THIS_STATUS=$(( ($(date +"%s") - $ENTERED_CUR_STATUS) ))
-        if [[ "$DAG_STATUS" == "1" || "$DAG_STATUS" == "2" || $TIME_IN_THIS_STATUS -lt $ONE_DAY ]]; then
-            EXIT_NOW=False
+    NOT_DONE=0
+    echo "$DAG_INFO"|while read CLUSTER_ID DAG_STATUS ENTERED_CUR_STATUS; do
+        if [[ "$DAG_STATUS" == "1" || "$DAG_STATUS" == "2" || $(( ($(date +"%s") - $ENTERED_CUR_STATUS) < 24 * 3600 )) ]]; then
+            NOT_DONE=$(( $NOT_DONE + 1 ))
         fi
-    done <<< "$DAG_INFO"
-    echo $EXIT_NOW
+    done
+    echo $(( $NOT_DONE == 0 ))
 }
 
 function dag_status {
     [[ "$DAG_INFO" == "init" || ! "$DAG_INFO" ]] && return
-    while read CLUSTER_ID DAG_STATUS ENTERED_CUR_STATUS; do
-        log "Dag status code for $CLUSTER_ID: $DAG_STATUS Entered current status date: $(date -d @$ENTERED_CUR_STATUS '+%Y/%m/%d %H:%M:%S %Z')"
-    done <<< "$DAG_INFO"
+    echo "$DAG_INFO"|while read CLUSTER_ID DAG_STATUS ENTERED_CUR_STATUS; do
+        echo "Dag status code for $CLUSTER_ID: $DAG_STATUS Entered current status date: $(date -d @$ENTERED_CUR_STATUS '+%Y/%m/%d %H:%M:%S %Z')"
+    done
 }
 
 function perform_condorq {
-    DAG_INFO=$(condor_q -constr 'CRAB_ReqName =?= "'$REQUEST_NAME'" && stringListMember(TaskType, "ROOT PROCESSING TAIL", " ")' -af ClusterId JobStatus EnteredCurrentStatus)
+    DAG_INFO=$(condor_q -constr 'CRAB_ReqName =?= "'$REQUEST_NAME'" && TaskType =!= "Job"' -af ClusterId JobStatus EnteredCurrentStatus)
     TIME_OF_LAST_QUERY=$(date +"%s")
-    log "HTCondor query of DAG status done on $(date '+%Y/%m/%d %H:%M:%S %Z')"
+    echo "Query done on $(date '+%Y/%m/%d %H:%M:%S %Z')"
 }
 
 if [ ! -f /etc/enable_task_daemon ]; then
-    log "/etc/enable_task_daemon file not found, not starting the task daemon and exiting"
+    echo "/etc/enable_task_daemon file not found, not starting the task daemon and exiting"
     exit 1
 fi
 
+if [ ! -e task_process/fts_jobids.txt  ]; then
+        echo "task_process/fts_jobids.txt file not found, touching"
+        touch task_process/fts_jobids.txt
+fi
+
+if [ ! -e task_process/last_transfer.txt ]; then
+        echo "task_process/last_transfer.txt file not found, touching"
+        echo "0" > task_process/last_transfer.txt
+fi
+
 touch task_process/task_process_running
-log "Starting a new task_process, creating task_process_running file"
+echo "Starting a new task_process, creating task_process_running file"
 
 
 HOURS_BETWEEN_QUERIES=24
 
 # The request name is passed from the dagman_bootstrap_startup.sh and points to the main dag
 REQUEST_NAME=$1
-log "REQUEST_NAME: $REQUEST_NAME"
+echo "REQUEST_NAME: $REQUEST_NAME"
 
 # Sleeping until files in the spool dir are created. TODO - make this smarter
 sleep 60s
@@ -77,7 +82,7 @@ TIME_OF_LAST_QUERY=$(date +"%s")
 # submission is most likely pointless and relatively expensive, the script will run normally and perform the query later.
 DAG_INFO="init"
 
-log "Starting task daemon wrapper"
+echo "Starting task daemon wrapper"
 while true
 do
     # This is part of the logic for handling empty condor_q results. Because condor_q can sometimes return empty,
@@ -87,18 +92,23 @@ do
     # is removed almost immediately by htcondor after the dag disappears from the queue. Otherwise, this wrapper script
     # which is loaded in memory, would keep trying to execute the non-existent file.
     if [[ ! -f task_process/cache_status.py  ]]; then
-        log "task_process/cache_status.py file not found, exiting."
+        echo "task_process/cache_status.py file not found, exiting."
+        exit 1
+    fi
+    if [[ ! -f task_process/transfer_inject.py  ]]; then
+        echo "task_process/transfer_inject.py file not found, exiting."
         exit 1
     fi
 
+    export PYTHONPATH=$PWD/CRAB3.zip:$PYTHONPATH
     # Run the parsing script
     cache_status
+    manage_transfers
     sleep 300s
 
     # Calculate how much time has passed since the last condor_q and perform it again if it has been long enough.
     if [ $(($(date +"%s") - $TIME_OF_LAST_QUERY)) -gt $(($HOURS_BETWEEN_QUERIES * 3600)) ]; then
         perform_condorq
-        dag_status
     fi
 
     # Once the dags' status changes from 1 (idle) or 2 (running) to something else,
@@ -116,26 +126,27 @@ do
     # Note that here we also ignore an empty DAG_INFO result because it could be a temporary problem with condor_q
     # simply returning empty. If the dag isn't actually in the queue anymore, the check for an existing caching script
     # at the start of the loop should catch that and exit.
+    dag_status
 
-    # Test if 24 hours have elapsed since the last saved condor status
-    if [ "$(exit_now)" == "True" ]; then
+    if [ "$(check_exit)" == "1" ]; then
         # Before we really decide to exit, we should run condor_q once more
-        # to get the latest info about the DAGs. Even though exit_now may say yes,
+        # to get the latest info about the DAGs. Even though check_exit may pass successfully,
         # because we do condor_q only every 24h (and also wait for 24 hours after ENTERED_CUR_STATUS),
-        # the information used in exit_now could be out of date - the task may have been resubmitted
+        # the information used in check_exit could be out of date - the task may have been resubmitted
         # after our last condor_q, for example.
-        log "Running an extra condor_q check before exitting"
+        echo "Running an extra condor_q check before exitting"
         perform_condorq
-        dag_status
-        if [ "$(exit_now)" == "True" ]; then
-            log "Dag(s) has (have) been in one of the final states for over 24 hours."
-            log "Caching the status one last time, removing the task_process/task_process_running file and exiting."
+        if [ "$(check_exit)" == "1" ]; then
+
+            echo "Dag has been in one of the final states for over 24 hours."
+            echo "Caching the status one last time, removing the task_process/task_process_running file and exiting."
 
             cache_status
             rm task_process/task_process_running
 
             exit 0
         fi
-        log "Cannot exit yet!"
+        echo "Cannot exit yet!"
+        dag_status
     fi
 done
