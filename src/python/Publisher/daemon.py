@@ -10,13 +10,13 @@ Here's the algorithm
 """
 from __future__ import division
 from __future__ import print_function
+import argparse
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import os
 import subprocess
 import traceback
 import sys
-import cStringIO
 import json
 import datetime
 import time
@@ -30,7 +30,6 @@ from utils import getDNFromUserName
 from ServerUtilities import getColumn, encodeRequest, oracleOutputMapping
 
 
-configuration = loadConfigurationFile(os.path.abspath('/data/srv/TaskManager/3.3.1803.patch2/slc6_amd64_gcc493/cms/crabtaskworker/3.3.1803.patch2/lib/python2.7/site-packages/Publisher/config.py'))
 
 
 def setProcessLogger(name):
@@ -441,6 +440,12 @@ class Worker(object):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--config', help='Publisher config file', default='config.py')
+
+    args = parser.parse_args()
+    configuration = loadConfigurationFile(os.path.abspath(args.config))
 
     master = Worker(configuration, False)
     while(True):
