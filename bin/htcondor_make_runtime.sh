@@ -10,11 +10,11 @@ STARTDIR=$PWD/tmp/runtime
 CRAB3_VERSION=3.3.0-pre1
 
 WMCOREDIR=$STARTDIR/WMCore
-WMCOREVER=1.1.14.crab1
+WMCOREVER=1.1.17.pre1
 WMCOREREPO=dmwm
 
 CRABSERVERDIR=$STARTDIR/CRABServer
-CRABSERVERVER=3.3.1706.rc2
+CRABSERVERVER=3.3.1809.rc8
 CRABSERVERREPO=dmwm
 
 [[ -d $STARTDIR ]] || mkdir -p $STARTDIR
@@ -103,7 +103,7 @@ else
     popd
 
     pushd $CRABSERVER_PATH/src/python
-    zip -rq $STARTDIR/CRAB3.zip RESTInteractions.py HTCondorUtils.py HTCondorLocator.py TaskWorker CRABInterface  -x \*.pyc || exit 3
+    zip -rq $STARTDIR/CRAB3.zip RESTInteractions.py HTCondorUtils.py HTCondorLocator.py TaskWorker CRABInterface TransferInterface -x \*.pyc || exit 3
     popd
 
     mkdir -p bin

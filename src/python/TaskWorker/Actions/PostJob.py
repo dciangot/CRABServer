@@ -841,11 +841,13 @@ class ASOServerJob(object):
                     msg += "\n%s" % (str(hte.headers))
                     returnMsg['error'] = msg
             if toTransfer:
+                if not 'checksums' in newDoc:
+                    newDoc['checksums'] = doc['checksums']
                 if not 'destination_lfn' in newDoc:
                     newDoc['destination_lfn'] = doc['destination_lfn']
                 if not 'destination' in newDoc:
                     newDoc['destination'] = doc['destination']
-                with open('task_process/transfers.txt', 'a') as transfers_file:
+                with open('task_process/transfers.txt', 'a+') as transfers_file:
                     transfer_dump = json.dumps(newDoc)
                     transfers_file.write(transfer_dump+"\n")
                 if not os.path.exists('task_process/rest_filetransfers.txt'):

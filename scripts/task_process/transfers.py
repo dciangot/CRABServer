@@ -8,7 +8,11 @@ import json
 import logging
 import threading
 import os
+import re
 import subprocess
+
+from TransferInterface import submission_manager_rucio
+from TransferInterface.MonitorTransfers import monitor_manager_rucio
 
 from WMCore.Services.PhEDEx.PhEDEx import PhEDEx
 from WMCore.Storage.TrivialFileCatalog import readTFC
@@ -545,33 +549,57 @@ def algorithm():
         + update info in oracle
     - append new fts job ids to fts_jobids.txt
     """
+    crab_rucio = False
 
-    # TODO: pass by configuration
-    fts = HTTPRequests('fts3.cern.ch:8446/',
-                       proxy,
-                       proxy)
+    dest = ""
+    with open("task_process/transfers.txt") as _list:
+        dest = json.loads(_list.readlines()[0])["destination_lfn"]
 
-    ftsContext = fts3.Context('https://fts3.cern.ch:8446', proxy, proxy, verify=True)
-    logging.debug("Delegating proxy to FTS: "+fts3.delegate(ftsContext, lifetime=timedelta(hours=48), force=False))
+    if re.search(r'*/rucio/*', dest):
+        crab_rucio = True
 
-    log_phedex = logging.getLogger('phedex')
 
-    # Uncomment the 2 lines below if you want to enable phedex logging 
-    # log_phedex.addHandler(logging.FileHandler('mylogfile.log', mode='a', encoding=None, delay=False))
-    # log_phedex.setLevel(logging.INFO)
+    if not crab_rucio:
+        # TODO: pass by configuration
+        fts = HTTPRequests('fts3.cern.ch:8446/',
+                        proxy,
+                        proxy)
 
-    try:
-        phedex = PhEDEx(responseType='xml', logger=log_phedex,
-                        httpDict={'key': proxy, 'cert': proxy, 'pycurl': True})
-    except Exception as e:
-        logging.exception('PhEDEx exception: %s', e)
-        return
+        ftsContext = fts3.Context('https://fts3.cern.ch:8446', proxy, proxy, verify=True)
+        logging.debug("Delegating proxy to FTS: "+fts3.delegate(ftsContext, lifetime=timedelta(hours=48), force=False))
 
-    jobs_ongoing = state_manager(fts)
-    new_jobs = submission_manager(phedex, ftsContext)
+        log_phedex = logging.getLogger('phedex')
 
-    logging.info("Transfer jobs ongoing: %s, new: %s ", jobs_ongoing, new_jobs)
+        # Uncomment the 2 lines below if you want to enable phedex logging 
+        # log_phedex.addHandler(logging.FileHandler('mylogfile.log', mode='a', encoding=None, delay=False))
+        # log_phedex.setLevel(logging.INFO)
 
+        try:
+            phedex = PhEDEx(responseType='xml', logger=log_phedex,
+                            httpDict={'key': proxy, 'cert': proxy, 'pycurl': True})
+        except Exception as e:
+            logging.exception('PhEDEx exception: %s', e)
+            return
+
+        jobs_ongoing = state_manager(fts)
+        new_jobs = submission_manager(phedex, ftsContext)
+
+        logging.info("Transfer jobs ongoing: %s, new: %s ", jobs_ongoing, new_jobs)
+
+    if crab_rucio:
+        user = None
+        try:
+            user, taskname = submission_manager_rucio()
+        except Exception:
+            logging.exception('Submission proccess failed.')
+
+        if not user:
+            logging.info('Nothing to monitor yet.')
+            return
+        try:
+            monitor_manager_rucio(user, taskname)
+        except Exception:
+            logging.exception('Monitor proccess failed.')
     return
 
 
