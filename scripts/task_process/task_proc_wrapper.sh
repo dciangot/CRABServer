@@ -17,9 +17,9 @@ function manage_transfers {
 
     if [[ $DEST_LFN =~ ^/store/test/rucio/* ]]; then
       source /cvmfs/cms.cern.ch/rucio/setup.sh
-      timeout 15m python task_process/RUCIO_transfers.py
+      timeout 15m python task_process/RUCIO_Transfers.py
     else
-      timeout 15m python task_process/FTS_transfers.py
+      timeout 15m python task_process/FTS_Transfers.py
     fi
 
     err=$?
