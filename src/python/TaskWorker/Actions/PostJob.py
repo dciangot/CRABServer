@@ -77,10 +77,13 @@ import datetime
 import tempfile
 import traceback
 import logging.handlers
+import htcondor
+import classad
 from shutil import move
 from httplib import HTTPException
 
 import DashboardAPI
+import HTCondorUtils
 import WMCore.Database.CMSCouch as CMSCouch
 from WMCore.DataStructs.LumiList import LumiList
 from WMCore.Services.WMArchive.DataMap import createArchiverDoc
@@ -675,7 +678,7 @@ class ASOServerJob(object):
                         msg += " but does not correspond to the current job retry."
                         msg  = msg % (source_lfn, doc_id, transfer_status)
                         if transfer_status in ['acquired', 'new', 'retry']:
-                            msg += "\nFile transfer status is not terminal ('done', 'failed' or 'killed')."
+                            msg += "\nFile transfer status is %s, which is not terminal ('done', 'failed' or 'killed')." % transfer_status
                             msg += " Will not inject a new document for the current job retry."
                             self.logger.info(msg)
                             needs_commit = False
@@ -751,8 +754,6 @@ class ASOServerJob(object):
                         msg = "Error injecting document to ASO database:\n%s" % (commit_result_msg)
                         self.logger.info(msg)
                         return False
-                    ## If the upload succeds then record the timestamp in the fwjr (if not already present)
-                    self.recordASOStartTime()
                 ## Record all files for which we want the post-job to monitor their transfer.
                 if needs_transfer:
                     doc_info = {'doc_id'     : doc_id,
@@ -760,6 +761,9 @@ class ASOServerJob(object):
                                 'delayed_publicationflag_update' : delayed_publicationflag_update
                                }
                     docs_in_transfer.append(doc_info)
+                    # Make sure that the fjr has the record of the ASO start transfer time stamp
+                    self.recordASOStartTime()
+
 
         self.logger.info("====== Finished to check uploads to ASO database.")
 
@@ -1134,6 +1138,7 @@ class ASOServerJob(object):
                     continue
                 doc['state'] = 'killed'
                 doc['end_time'] = now
+                username = doc['username']
                 if isCouchDBURL(self.aso_db_url):
                     # In case it is still CouchDB leave this in this loop and for RDBMS add
                     # everything to a list and update this with one call for multiple files.
@@ -1159,22 +1164,34 @@ class ASOServerJob(object):
                 else:
                     transfersToKill.append(doc_id)
 
-        if not isCouchDBURL(self.aso_db_url):
-            # Now this means that we have a list of ids which needs to be killed
-            # First try to kill ALL in one API call
-            newDoc = {'listOfIds': transfersToKill,
-                      'subresource': 'killTransfersById'}
-            try:
-                killedFiles = self.server.post(self.rest_uri_file_user_transfers, data=encodeRequest(newDoc, ['listOfIds']))
-                not_cancelled = killedFiles[0]['result'][0]['failedKill']
-                cancelled = killedFiles[0]['result'][0]['killed']
-            except HTTPException as hte:
-                msg  = "Error setting KILL status in database."
-                msg += " Transfer KILL failed."
-                msg += "\n%s" % (str(hte.headers))
-                self.logger.warning(msg)
-                not_cancelled = transfersToKill
-                cancelled = []
+            if not isCouchDBURL(self.aso_db_url):
+                # Now this means that we have a list of ids which needs to be killed
+                # First try to kill ALL in one API call
+                newDoc = {'listOfIds': transfersToKill,
+                          'publish' : 0,
+                          'username': username,
+                          'subresource': 'killTransfersById'}
+                try:
+                    killedFiles = self.server.post(self.rest_uri_file_user_transfers, data=encodeRequest(newDoc, ['listOfIds']))
+                    not_cancelled = killedFiles[0]['result'][0]['failedKill']
+                    cancelled = killedFiles[0]['result'][0]['killed']
+                    break  # no need to retry
+                except HTTPException as hte:
+                    msg  = "Error setting KILL status in database."
+                    msg += " Transfer KILL failed."
+                    msg += "\n%s" % (str(hte.headers))
+                    self.logger.warning(msg)
+                    not_cancelled = transfersToKill
+                    cancelled = []
+                except Exception as ex:
+                    msg  = "Unknown error setting KILL status in database."
+                    msg += " Transfer KILL failed."
+                    msg += "\n%s" % (str(ex))
+                    self.logger.error(msg)
+                    not_cancelled = transfersToKill
+                    cancelled = []
+
+
             # Ok Now lets do a double check on doc_ids which failed to update one by one.
             # It is just to make proof concept to cover KILL to RDBMS
             self.logger.info("Failed to kill %s and succeeded to kill %s", not_cancelled, cancelled)
@@ -1183,6 +1200,8 @@ class ASOServerJob(object):
             # and also kill if status is not in KILL or KILLED
             for docIdKill in transfersToKill:
                 newDoc = {'listOfIds': [docIdKill],
+                          'publish': 0,
+                          'username': self.job_ad['CRAB_UserHN'],
                           'subresource': 'killTransfersById'}
                 try:
                     doc_out = self.getDocByID(docIdKill)
@@ -1246,6 +1265,7 @@ class PostJob():
         self.source_dir          = None
         self.dest_dir            = None
         self.logs_arch_file_name = None
+        self.stage               = None
         self.output_files_names  = None
         ## The crab_retry is the number of times the post-job was ran (not necessarilly
         ## completing) for this job id.
@@ -1286,6 +1306,7 @@ class PostJob():
         ## ID is -1 (and the $RETURN argument macro is -1004). This is just the first
         ## number in self.dag_jobid.
         self.dag_clusterid       = None
+        self.schedd = htcondor.Schedd()
 
         ## Set a logger for the post-job. Use a memory handler by default. Once we know
         ## the name of the log file where all the logging should go, we will flush the
@@ -1321,13 +1342,13 @@ class PostJob():
                         #if the line is empty we are sure it's the first try. See comment 10 lines below
                         defer_num = 0
             except IOError as e:
-                self.logger.error("I/O error({0}): {1}".format(e.errno, e.strerror))
+                self.logger.error("I/O error(%d): %s", e.errno, e.strerror)
                 raise
             except ValueError:
                 self.logger.error("Could not convert data to an integer.")
                 raise
             except:
-                self.logger.exception("Unexpected error: %s" % sys.exc_info()[0])
+                self.logger.exception("Unexpected error: %s", sys.exc_info()[0])
                 raise
         else:
             #create the file if it does not exist
@@ -1343,10 +1364,10 @@ class PostJob():
                 #put some spaces to overwrite possibly longer numbers (should never happen, but..)
                 fd.write(str(defer_num + 1) + ' '*10)
         except IOError as e:
-            self.logger.error("I/O error({0}): {1}".format(e.errno, e.strerror))
+            self.logger.error("I/O error(%d): %s", e.errno, e.strerror)
             raise
         except:
-            self.logger.exception("Unexpected error: %s" % sys.exc_info()[0])
+            self.logger.exception("Unexpected error: %s", sys.exc_info()[0])
             raise
 
         return defer_num
@@ -1495,7 +1516,7 @@ class PostJob():
         DEFER_NUM = self.get_defer_num()
 
         if first_pj_execution():
-            self.logger.info("======== Starting execution on %s. Task Worker Version %s" % (os.uname()[1], __version__))
+            self.logger.info("======== Starting execution on %s. Task Worker Version %s", os.uname()[1], __version__)
 
         ## Create the task web directory in the schedd. Ignore if it exists already.
         self.create_taskwebdir()
@@ -1523,6 +1544,7 @@ class PostJob():
             self.logger.error(msg)
             if self.crab_retry is not None:
                 self.set_dashboard_state('FAILED')
+                self.set_state_ClassAds('FAILED')
             retval = JOB_RETURN_CODES.FATAL_ERROR
             self.log_finish_msg(retval)
             return retval
@@ -1639,7 +1661,7 @@ class PostJob():
         """
         Logs a message with the post-job return code.
         """
-        self.logger.info("======== Finished post-job execution with status code %s." % (retval))
+        self.logger.info("======== Finished post-job execution with status code %s.", retval)
 
     ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
@@ -1668,6 +1690,7 @@ class PostJob():
                 msg = "The retry handler indicated this was a fatal error."
                 self.logger.info(msg)
                 self.set_dashboard_state('FAILED')
+                self.set_state_ClassAds('FAILED')
                 self.logger.info("====== Finished to analyze job exit status.")
                 res = JOB_RETURN_CODES.FATAL_ERROR, ""
             elif self.retryjob_retval == JOB_RETURN_CODES.RECOVERABLE_ERROR:
@@ -1677,6 +1700,7 @@ class PostJob():
                     msg += " DAGMan will not retry."
                     self.logger.info(msg)
                     self.set_dashboard_state('FAILED')
+                    self.set_state_ClassAds('FAILED')
                     self.logger.info("====== Finished to analyze job exit status.")
                     res = JOB_RETURN_CODES.FATAL_ERROR, ""
                 else:
@@ -1684,6 +1708,7 @@ class PostJob():
                     msg += " DAGMan will retry."
                     self.logger.info(msg)
                     self.set_dashboard_state('COOLOFF')
+                    self.set_state_ClassAds('COOLOFF')
                     self.logger.info("====== Finished to analyze job exit status.")
                     res = JOB_RETURN_CODES.RECOVERABLE_ERROR, ""
             else:
@@ -1691,6 +1716,7 @@ class PostJob():
                 msg += " Will consider this as a fatal error. DAGMan will not retry."
                 self.logger.info(msg)
                 self.set_dashboard_state('FAILED')
+                self.set_state_ClassAds('FAILED')
                 self.logger.info("====== Finished to analyze job exit status.")
                 res = JOB_RETURN_CODES.FATAL_ERROR, "" #MarcoM: this should never happen
         ## This is for the case in which we don't run the retry-job.
@@ -1700,6 +1726,7 @@ class PostJob():
                 msg += " Setting this node (job) to permanent failure."
                 self.logger.info(msg)
                 self.set_dashboard_state('FAILED')
+                self.set_state_ClassAds('FAILED')
                 self.logger.info("====== Finished to analyze job exit status.")
                 res = JOB_RETURN_CODES.FATAL_ERROR, ""
         else:
@@ -1754,9 +1781,9 @@ class PostJob():
             outlumis += LumiList(runsAndLumis=input_['runs'])
 
         missing = inlumis - outlumis
-        self.logger.info("Lumis expected to be processed: {0}".format(len(inlumis.getLumis())))
-        self.logger.info("Lumis actually processed:       {0}".format(len(outlumis.getLumis())))
-        self.logger.info("Difference in lumis:            {0}".format(len(missing.getLumis())))
+        self.logger.info("Lumis expected to be processed: %d", len(inlumis.getLumis()))
+        self.logger.info("Lumis actually processed:       %d", len(outlumis.getLumis()))
+        self.logger.info("Difference in lumis:            %d", len(missing.getLumis()))
         if len(missing.getLumis()) == 0:
             # we don't want to create the subjobs if the job processed everything
             return
@@ -1794,9 +1821,9 @@ class PostJob():
             condor_history_dir = os.environ.get("_CONDOR_PER_JOB_HISTORY_DIR", "")
             job_ad_file_name = os.path.join(condor_history_dir, str("history." + str(self.dag_jobid)))
         counter = 0
-        self.logger.info("====== Starting to parse job ad file %s." % (job_ad_file_name))
+        self.logger.info("====== Starting to parse job ad file %s.", job_ad_file_name)
         while counter < 5:
-            self.logger.info("       -----> Started %s time out of %s -----" % (str(counter), "5"))
+            self.logger.info("       -----> Started %s time out of %s -----", str(counter), "5")
             parse_job_ad_exit = self.parse_job_ad(job_ad_file_name)
             if not parse_job_ad_exit:
                 used_job_ad = True
@@ -1826,9 +1853,10 @@ class PostJob():
             ## only (actually almost only) global parameters that are available in the main
             ## ROOT job ad, so we can fallback to read this main ROOT job ad here.
             job_ad_file_name = os.environ.get("_CONDOR_JOB_AD", ".job.ad")
-            self.logger.info("====== Starting to parse ROOT job ad file %s." % (job_ad_file_name))
+            self.logger.info("====== Starting to parse ROOT job ad file %s.", job_ad_file_name)
             if self.parse_job_ad(job_ad_file_name):
                 self.set_dashboard_state('FAILED', exitCode=89999)
+                self.set_state_ClassAds('FAILED', exitCode=89999)
                 self.logger.info("====== Finished to parse ROOT job ad.")
                 retmsg = "Failure parsing the ROOT job ad."
                 return JOB_RETURN_CODES.FATAL_ERROR, retmsg
@@ -1851,9 +1879,10 @@ class PostJob():
         if not first_pj_execution():
             self.logger.setLevel(logging.ERROR)
         ## Parse the job report.
-        self.logger.info("====== Starting to parse job report file %s." % (G_JOB_REPORT_NAME))
+        self.logger.info("====== Starting to parse job report file %s.", G_JOB_REPORT_NAME)
         if self.parse_job_report():
             self.set_dashboard_state('FAILED', exitCode=89999)
+            self.set_state_ClassAds('FAILED', exitCode=89999)
             self.logger.info("====== Finished to parse job report.")
             retmsg = "Failure parsing the job report."
             return JOB_RETURN_CODES.FATAL_ERROR, retmsg
@@ -1878,6 +1907,7 @@ class PostJob():
             msg += " Finishing post-job execution with exit code 0."
             self.logger.info(msg)
             self.set_dashboard_state('FINISHED')
+            self.set_state_ClassAds('FINISHED')
             return 0, ""
 
         ## Give a message about the transfer flags.
@@ -1956,6 +1986,7 @@ class PostJob():
                 msg = "There was at least one permanent stageout error; user will need to resubmit."
                 self.logger.error(msg)
                 self.set_dashboard_state('FAILED', exitCode=mostCommon(self.stageout_exit_codes, 60324))
+                self.set_state_ClassAds('FAILED', exitCode=mostCommon(self.stageout_exit_codes, 60324))
                 self.logger.info("====== Finished to check for ASO transfers.")
                 return JOB_RETURN_CODES.FATAL_ERROR, retmsg
             except RecoverableStageoutError as rse:
@@ -1999,7 +2030,7 @@ class PostJob():
                 self.logger.info("====== About to update publication flags of transfered files.")
                 for doc in getattr(ASO_JOB, 'docs_in_transfer', []):
                     doc_id = doc.get('doc_id')
-                    self.logger.debug("Found doc %s" % doc_id)
+                    self.logger.debug("Found doc %s", doc_id)
                     if doc.get('delayed_publicationflag_update'):
                         newDoc = {
                             'subresource' : 'updatePublication',
@@ -2018,6 +2049,7 @@ class PostJob():
                 self.logger.info("====== Finished to update publication flags of transfered files.")
 
         self.set_dashboard_state('FINISHED')
+        self.set_state_ClassAds('FINISHED')
 
         return 0, ""
 
@@ -2032,7 +2064,7 @@ class PostJob():
         """
         env_file = "postjob_env.txt"
         if not os.path.exists(env_file) or not os.stat(env_file).st_size:
-            self.logger.info("Will write env variables to %s file." % env_file)
+            self.logger.info("Will write env variables to %s file.", env_file)
             try:
                 with open(env_file, "w") as fd:
                     fd.write("------ Environment variables:\n")
@@ -2040,9 +2072,8 @@ class PostJob():
                         fd.write("%30s    %s\n" % (key, os.environ[key]))
             except:
                 self.logger.info("Not able to write ENV variables to a file. Continuing")
-                pass
         else:
-            self.logger.info("Will not write %s file. Continue." % env_file)
+            self.logger.info("Will not write %s file. Continue.", env_file)
         # if job_ad is available, write it output to PostJob log file
         if self.job_ad:
             self.logger.debug("------ Job classad values for debug purposes:")
@@ -2110,7 +2141,7 @@ class PostJob():
             msg += "\nAttempts were made to cancel the ongoing transfers,"
             msg += " but cancellation failed for some transfers."
             msg += "\nConsidering cancellation failures as a permament stageout error."
-            self.stageout_exit_codes.append(60321)
+            self.stageout_exit_codes.append(60317)
             raise PermanentStageoutError(msg)
 
         ## Retrieve the stageout failures (a dictionary where the keys are the IDs of
@@ -2620,8 +2651,45 @@ class PostJob():
                  }
         if reason:
             params['StatusValueReason'] = reason
-        ## Take exit code from job_fjr.<job_id>.<retry_id>.json and report final exit code to Dashboard.
-        ## Only taken if RetryJob think it is FATAL_ERROR.
+        self.monitoringExitCode(params, exitCode)
+        ## Unfortunately, Dashboard only has 1-second resolution; we must separate all
+        ## updates by at least 1s in order for it to get the correct ordering.
+        time.sleep(1)
+        msg += " Dashboard parameters: %s" % (str(params))
+        self.logger.info(msg)
+        DashboardAPI.apmonSend(params['MonitorID'], params['MonitorJobID'], params)
+        self.logger.info("====== Finished to prepare/send report to dashboard.")
+
+    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+
+    def set_state_ClassAds(self, state, exitCode = None):
+        """
+        Update PostJobStatus and job exit-code among the job ClassAds for the monitoring script to update the Grafana dashboard.
+        """
+        if os.environ.get('TEST_POSTJOB_NO_STATUS_UPDATE', False):
+            self.schedd.edit([self.dag_jobid], "LeaveJobInQueue", classad.ExprTree("false"))
+            return
+        self.logger.info("====== Starting to update classAds.")
+        msg = "status: %s." % (state)
+        params = {'CRAB_PostJobStatus': '"{0}"'.format(state)}
+        self.monitoringExitCode(params, exitCode)
+        msg += " ClassAds values to set are: %s" % (str(params))
+        self.logger.info(msg)
+        with HTCondorUtils.AuthenticatedSubprocess(os.environ['X509_USER_PROXY'], logger=self.logger) as (parent, rpipe):
+            if not parent:
+                for param in params:
+                    self.schedd.edit([self.dag_jobid], param, str(params[param]))
+                self.schedd.edit([self.dag_jobid], 'CRAB_PostJobLastUpdate', str(time.time()))
+                # Once state classAds have been updated, let HTCondor remove the job from the queue
+                self.schedd.edit([self.dag_jobid], "LeaveJobInQueue", classad.ExprTree("false"))
+                self.logger.info("====== Finished to update classAds.")
+
+    ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+
+    def monitoringExitCode(self, params, exitCode):
+        """
+        Take exit code from job_fjr.<job_id>.<retry_id>.json only if RetryJob thinks it is FATAL_ERROR.
+        """
         if self.retryjob_retval and self.retryjob_retval == JOB_RETURN_CODES.FATAL_ERROR and not exitCode:
             try:
                 with open(G_JOB_REPORT_NAME_NEW, 'r') as fd:
@@ -2633,28 +2701,19 @@ class PostJob():
                             params['ExeExitCode'] = report['jobExitCode']
                     except ValueError as e:
                         self.logger.debug("Not able to load the fwjr because of a ValueError %s. \
-                                           Not setting exit code for dashboard. Continuing normally" % (e))
+                                           Not setting exit code for dashboard. Continuing normally", e)
                         ## Means that file exists, but failed to load json
                         ## Don`t fail and go ahead with reporting to dashboard
-                        pass
             except IOError as e:
                 ## File does not exist. Don`t fail and go ahead with reporting to dashboard
                 self.logger.debug("Not able to load the fwjr because of a IOError %s. \
-                                   Not setting exitcode for dashboard. Continuing normally." % (e))
-                pass
+                                   Not setting exitcode for dashboard. Continuing normally.", e)
         ## If Exit Code is defined we report only it. It is the final exit Code of the job
         elif exitCode:
             self.logger.debug("Dashboard exit code is defined by Postjob execution.")
             params['JobExitCode'] = exitCode
         else:
             self.logger.debug("Dashboard exit code already set on the worker node. Continuing normally.")
-        ## Unfortunately, Dashboard only has 1-second resolution; we must separate all
-        ## updates by at least 1s in order for it to get the correct ordering.
-        time.sleep(1)
-        msg += " Dashboard parameters: %s" % (str(params))
-        self.logger.info(msg)
-        DashboardAPI.apmonSend(params['MonitorID'], params['MonitorJobID'], params)
-        self.logger.info("====== Finished to prepare/send report to dashboard.")
 
     ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
@@ -2723,11 +2782,13 @@ class PostJob():
             msg += " Setting this node (job) to permanent failure. DAGMan will NOT retry."
             self.logger.info(msg)
             self.set_dashboard_state('FAILED', exitCode=exitCode)
+            self.set_state_ClassAds('FAILED', exitCode=exitCode)
             return JOB_RETURN_CODES.FATAL_ERROR
         else:
             msg = "Job will be retried by DAGMan."
             self.logger.info(msg)
             self.set_dashboard_state('COOLOFF', exitCode=exitCode)
+            self.set_state_ClassAds('COOLOFF', exitCode=exitCode)
             return JOB_RETURN_CODES.RECOVERABLE_ERROR
 
     ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
@@ -2851,7 +2912,7 @@ class PostJob():
         if not os.path.isdir(WMARCHIVE_BASE_LOCATION):
             os.makedirs(os.path.join(WMARCHIVE_BASE_LOCATION))
         #not using shutil.move because I want to move the file in the same disk
-        self.logger.info("%s , %s" % (G_WMARCHIVE_REPORT_NAME_NEW, os.path.join(WMARCHIVE_BASE_LOCATION, "%s_%s" % (self.reqname, G_WMARCHIVE_REPORT_NAME_NEW))))
+        self.logger.info("%s , %s", G_WMARCHIVE_REPORT_NAME_NEW, os.path.join(WMARCHIVE_BASE_LOCATION, "%s_%s" % (self.reqname, G_WMARCHIVE_REPORT_NAME_NEW)))
         os.rename(G_WMARCHIVE_REPORT_NAME_NEW, os.path.join(WMARCHIVE_BASE_LOCATION, "%s_%s" % (self.reqname, G_WMARCHIVE_REPORT_NAME_NEW)))
 
 ##==============================================================================

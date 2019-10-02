@@ -82,11 +82,6 @@ if [[ "x$RPM_RELEASE" != "x" ]]; then
 
 else
 
-    #if [[ ! -e libcurl.so.4 ]]; then
-    #    curl -L http://hcc-briantest.unl.edu/libcurl.so.4 > $STARTDIR/libcurl.so.4 || exit 2
-    #fi
-    #chmod +x libcurl.so.4
-
     if [[ -d "$REPLACEMENT_ABSOLUTE/WMCore" ]]; then
         echo "Using replacement WMCore source at $REPLACEMENT_ABSOLUTE/WMCore"
         WMCORE_PATH="$REPLACEMENT_ABSOLUTE/WMCore"
