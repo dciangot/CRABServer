@@ -23,15 +23,19 @@ function manage_transfers {
         timeout 15m python task_process/FTS_transfers.py
         fi
 
-        err=$?
-        if [ $err -eq 137 ] || [ $err -eq 124 ]; then
-            log "ERROR: transfers.py exited with process timeout";
-        elif [ $err -eq 0 ]; then
-            log "transfers.py exited.";
-        else log "ERROR: transfers.py exited with $err";
-        fi
+    if [[ $DEST_LFN =~ ^/store/test/rucio/* ]]; then
+      source /cvmfs/cms.cern.ch/rucio/setup.sh
+      timeout 15m python task_process/RUCIO_Transfers.py
     else
-        log "No transfers.txt found, waiting for jobs to finish.";
+      timeout 15m python task_process/FTS_Transfers.py
+    fi
+
+    err=$?
+    if [ $err -eq 137 ] || [ $err -eq 124 ]; then
+        log "ERROR: transfers.py exited with process timeout";
+    elif [ $err -eq 0 ]; then
+        log "transfers.py exited.";
+    else log "ERROR: transfers.py exited with $err";
     fi
 }
 
@@ -116,7 +120,7 @@ do
 
     # Run the parsing script
     cache_status
-    [ -f USE_ASO_V2 ] && manage_transfers
+    manage_transfers
     sleep 300s
 
     # Calculate how much time has passed since the last condor_q and perform it again if it has been long enough.

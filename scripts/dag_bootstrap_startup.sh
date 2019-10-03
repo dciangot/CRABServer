@@ -11,11 +11,17 @@ for FILE in $1.dagman.out RunJobs.dag.dagman.out dbs_discovery.err dbs_discovery
     touch $FILE
 done
 
-export PATH="/opt/glidecondor/bin:/opt/glidecondor/sbin:/usr/local/bin:/bin:/usr/bin:/usr/bin:$PATH"
 export PATH="/data/srv/glidecondor/bin:/data/srv/glidecondor/sbin:/usr/local/bin:/bin:/usr/bin:/usr/bin:$PATH"
-export PYTHONPATH=/opt/glidecondor/lib/python:$PYTHONPATH
-export LD_LIBRARY_PATH=/opt/glidecondor/lib:/opt/glidecondor/lib/condor:.:$LD_LIBRARY_PATH
+export PYTHONPATH=/data/srv/glidecondor/lib/python:$PYTHONPATH
 export LD_LIBRARY_PATH=/data/srv/glidecondor/lib:/data/srv/glidecondor/lib/condor:.:$LD_LIBRARY_PATH
+
+os_ver=$(lsb_release -rs|cut -d. -f1)
+curl_path="/cvmfs/cms.cern.ch/slc${os_ver}_amd64_gcc700/external/curl/7.59.0"
+libcurl_path="${curl_path}/lib"
+source ${curl_path}/etc/profile.d/init.sh
+
+srcname=$0
+env > ${srcname%.sh}.env
 
 #Sourcing Remote Condor setup
 source_script=`grep '^RemoteCondorSetup =' $_CONDOR_JOB_AD | tr -d '"' | awk '{print $NF;}'`
@@ -135,17 +141,6 @@ else
     exit 1
 fi
 
-# Decide if this task will use ASO server of new ASO_v2 in serverless mode (aka ASOless)
-# where ASO is handled by task_process
-# do it here so that decision stays for task lifetime, even if schedd configuratoion
-# is changed at some point
-if [ -f /etc/enable_aso_v2 ] ;
-then
-    echo "Set this task to use ASO_v2"
-    touch USE_ASO_V2
-fi
-
-
 export _CONDOR_DAGMAN_LOG=$PWD/$1.dagman.out
 export _CONDOR_DAGMAN_GENERATE_SUBDAG_SUBMITS=False
 export _CONDOR_MAX_DAGMAN_LOG=0
@@ -186,6 +181,10 @@ else
     then
         echo "creating and executing task process daemon jdl"
         TASKNAME=`grep '^CRAB_ReqName =' $_CONDOR_JOB_AD | awk '{print $NF;}'`
+        CMSTYPE=`grep '^CMS_Type =' $_CONDOR_JOB_AD | awk '{print $NF;}'`
+        CMSWMTOOL=`grep '^CMS_WMTool =' $_CONDOR_JOB_AD | awk '{print $NF;}'`
+        CMSTTASKYPE=`grep '^CMS_TaskType =' $_CONDOR_JOB_AD | awk '{print $NF;}'`
+        CMSSUBMISSIONTOOL=`grep '^CMS_SubmissionTool =' $_CONDOR_JOB_AD | awk '{print $NF;}'`
 cat > task_process/daemon.jdl << EOF
 Universe      = local
 Executable    = task_process/task_proc_wrapper.sh
@@ -194,6 +193,11 @@ Log           = task_process/daemon.PC.log
 Output        = task_process/daemon.out.\$(Cluster).\$(Process)
 Error         = task_process/daemon.err.\$(Cluster).\$(Process)
 +CRAB_ReqName = $TASKNAME
++CMS_Type     = $CMSTYPE
++CMS_WMTool   = $CMSWMTOOL
++CMS_TaskType = $CMSTTASKYPE
++CMS_SubmissionTool = $CMSSUBMISSIONTOOL
+
 Queue 1
 EOF
         # TODO - remove chmod
