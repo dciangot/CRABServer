@@ -13,8 +13,6 @@ from subprocess import PIPE, Popen
 import requests
 from requests.exceptions import ReadTimeout
 
-from gfal2 import GError, Gfal2Context
-
 import rucio.rse.rsemanager as rsemgr
 from rucio.client.client import Client
 from rucio.common.exception import (DataIdentifierAlreadyExists, FileAlreadyExists, RucioException,
@@ -53,7 +51,6 @@ class CMSRucio(object):
 
         self.cli = Client(account=self.account, auth_type=self.auth_type, creds=self.creds)
 
-        self.gfal = Gfal2Context()
 
     def get_file_url(self, lfn, rse):
         """
@@ -86,31 +83,6 @@ class CMSRucio(object):
         url = url + prefix
         print("Determined base url %s" % url)
         return url
-
-    def check_storage(self, filemd, rse):
-        """
-        Check size and checksum of a file on storage
-        """
-        url = self.get_file_url(filemd['name'], rse)
-        print("checking url %s" % url)
-        try:
-            size = self.gfal.stat(str(url)).st_size
-            checksum = self.gfal.checksum(str(url), 'adler32')
-            print("got size and checksum of file: pfn=%s size=%s checksum=%s"
-                  % (url, size, checksum))
-        except GError:
-            print("no file found at %s" % url)
-            return False
-        if str(size) != str(filemd['size']):
-            print("wrong size for file %s. Expected %s got %s"
-                  % (filemd['name'], filemd['size'], size))
-            return False
-        if str(checksum) != str(filemd['checksum']):
-            print("wrong checksum for file %s. Expected %s git %s"
-                  % (filemd['name'], filemd['checksum'], checksum))
-            return False
-        print("size and checksum are ok")
-        return True
 
 
     def cms_blocks_in_container(self, container, scope='cms'):
