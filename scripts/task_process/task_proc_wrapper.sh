@@ -23,19 +23,15 @@ function manage_transfers {
         timeout 15m python task_process/FTS_transfers.py
         fi
 
-    if [[ $DEST_LFN =~ ^/store/test/rucio/* ]]; then
-      source /cvmfs/cms.cern.ch/rucio/setup.sh
-      timeout 15m python task_process/RUCIO_Transfers.py
+        err=$?
+        if [ $err -eq 137 ] || [ $err -eq 124 ]; then
+            log "ERROR: transfers.py exited with process timeout";
+        elif [ $err -eq 0 ]; then
+            log "transfers.py exited.";
+        else log "ERROR: transfers.py exited with $err";
+        fi
     else
-      timeout 15m python task_process/FTS_Transfers.py
-    fi
-
-    err=$?
-    if [ $err -eq 137 ] || [ $err -eq 124 ]; then
-        log "ERROR: transfers.py exited with process timeout";
-    elif [ $err -eq 0 ]; then
-        log "transfers.py exited.";
-    else log "ERROR: transfers.py exited with $err";
+        log "No transfers.txt found, waiting for jobs to finish.";
     fi
 }
 
