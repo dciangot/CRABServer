@@ -72,6 +72,7 @@ import tarfile
 import hashlib
 import logging
 import commands
+import subprocess
 import unittest
 import datetime
 import tempfile
@@ -79,11 +80,11 @@ import traceback
 import logging.handlers
 import htcondor
 import classad
+import random
 from shutil import move
 from httplib import HTTPException
 
 import DashboardAPI
-import HTCondorUtils
 import WMCore.Database.CMSCouch as CMSCouch
 from WMCore.DataStructs.LumiList import LumiList
 from WMCore.Services.WMArchive.DataMap import createArchiverDoc
@@ -1106,6 +1107,7 @@ class ASOServerJob(object):
         Killing actual FTS transfers (if possible) is left to ASO.
         """
         if doc_ids_reasons is None:
+            doc_ids_reasons = {}
             for doc_info in self.docs_in_transfer:
                 doc_id = doc_info['doc_id']
                 doc_ids_reasons[doc_id] = None
@@ -1520,6 +1522,8 @@ class PostJob():
 
         if first_pj_execution():
             self.logger.info("======== Starting execution on %s. Task Worker Version %s", os.uname()[1], __version__)
+        else:
+            self.logger.info("\n======== Starting execution again after deferral")
 
         ## Create the task web directory in the schedd. Ignore if it exists already.
         self.create_taskwebdir()
@@ -1601,8 +1605,9 @@ class PostJob():
         try:
             retval, retmsg = self.execute_internal()
             if retval == 4:
-                msg = "Defering the execution of the post-job."
+                msg = "Deferring the execution of the post-job."
                 self.logger.info(msg)
+                self.log_finish_msg(retval)
                 return retval
         except:
             self.logger.exception(retmsg)
@@ -1662,9 +1667,24 @@ class PostJob():
 
     def log_finish_msg(self, retval):
         """
-        Logs a message with the post-job return code.
+        Logs a message with the post-job return code. The meaning of the
+        exit codes has to be inferred by how/where appear in the DAGMAN spec
+        created in DagmanCreator.py's variable DAG_FRAGMENT and DAG manual
+        https://htcondor.readthedocs.io/en/v8_8_4/users-manual/dagman-applications.html
         """
-        self.logger.info("======== Finished post-job execution with status code %s.", retval)
+        msg = "*"*80 + "\n"
+        msg += "======== Finished post-job execution with status code %s " % retval
+        if retval == 0:
+            msg += " : SUCCESS"
+        if retval == 1:
+            msg += " : RECOVERABLE JOB FAIL. This jobs will be retried"
+        if retval == 2:
+            msg += " : NON-RECOVERABLE JOB FAIL. No retries"
+        if retval == 3:
+            msg += " : FATAL GLOBAL FAIL. Full DAG will stop"
+        if retval == 4:
+            msg += " : DEFERRING. PostJob will run again after 30 min"
+        self.logger.info(msg)
 
     ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
@@ -1819,19 +1839,58 @@ class PostJob():
         ## Please see: https://github.com/dmwm/CRABServer/issues/4618
         used_job_ad = False
         if self.dag_clusterid == -1:
+            # the grid job did not run, see the comments in execute() method
             job_ad_file_name = os.path.join(".", "finished_jobs", "job.%s.%d" % (self.job_id, self.dag_retry))
         else:
             condor_history_dir = os.environ.get("_CONDOR_PER_JOB_HISTORY_DIR", "")
             job_ad_file_name = os.path.join(condor_history_dir, str("history." + str(self.dag_jobid)))
+            jobad_in_condor_history = True  # will set to false if can't find the file above
+            ## Since Summer 2019 ( https://github.com/dmwm/CRABServer/issues/5854 ) we keep
+            ## jobs in HTCondor queue after job terminate so that PostJob can edit classAds
+            ## and get the info propagated to MONIT, therefore we create the job ad file 1st time PostJob runs
+            if not os.path.exists(job_ad_file_name):
+                self.logger.info('PER_JOB_HISTORY file %s not found , look in ./finished_jobs' % job_ad_file_name)
+                jobad_in_condor_history = False
+                job_ad_file_name = os.path.join(".", "finished_jobs", "job.%s.%d" % (self.job_id, self.dag_retry))
+            if not os.path.exists(job_ad_file_name):
+                self.logger.info('History file not found in ./finished_jobs. Create it by querying schedd')
+                counter = 0
+                while counter < 5:
+                    cmd = 'condor_q -l %s > %s' % (self.dag_jobid, job_ad_file_name)
+                    self.logger.info('Executing %s' % cmd)
+                    subproc = subprocess.Popen(cmd, stderr=subprocess.PIPE, shell=True)
+                    (stdout_data, stderr_data) = subproc.communicate()
+                    rc = subproc.returncode
+                    if rc==0:
+                        if os.path.getsize(job_ad_file_name)==0 :
+                            stderr_data = 'Empty ad file created. Maybe job %s was not found?' % self.dag_jobid
+                        else:
+                            time.sleep(2) # take a breath before opening the file which we just wrote
+                            break
+                    sleep_time = 10*pow(2,counter) # exponential backoff: 10, 20, 40, 80 ...
+                    self.logger.error('condor_q failed with rc= %d and stderr:\n%s' % (rc, stderr_data))
+                    self.logger.info('will try again in $d seconds' % sleep_time)
+                    time.sleep(sleep_time)
+                    counter += 1
+                if not rc == 0:
+                    self.logger.error("%d tries, still cant't talk to schedd. Reschedule the PostJob" % (counter))
+                    return 4
+                self.logger.info('History file %s created' % job_ad_file_name)
+
+        # there's no good reason anymore for the loop below. Guess was there to wait out a possible
+        # race where PostJob is started very quickly but job has not left the queue yet and thus the
+        # job_ad file is not present. I am keeping the code to minimize changes but reduce the counter to 1
         counter = 0
+        num_iter = 1
         self.logger.info("====== Starting to parse job ad file %s.", job_ad_file_name)
-        while counter < 5:
-            self.logger.info("       -----> Started %s time out of %s -----", str(counter), "5")
-            parse_job_ad_exit = self.parse_job_ad(job_ad_file_name)
-            if not parse_job_ad_exit:
+        while counter < num_iter:
+            self.logger.info("       -----> Attempt # %s of %s -----", str(counter), str(num_iter))
+            parse_job_ad_exit = self.parse_job_ad(job_ad_file_name)    # note: returns 0 if OK
+            if not parse_job_ad_exit:    # means success in previous line
                 used_job_ad = True
                 self.logger.info("       -----> Succeeded to parse job ad file -----")
-                if self.dag_clusterid != -1:
+                if self.dag_clusterid != -1 and jobad_in_condor_history :
+                    # copy the file to ./finished_jobs so further PJ iterations will find it
                     try:
                         shutil.copy2(job_ad_file_name, './finished_jobs/')
                         job_ad_source = "history.%s" % (self.dag_jobid)
@@ -2331,7 +2390,7 @@ class PostJob():
                 publishname = "%s-%s" % (publishname.rsplit('-', 1)[0], file_info['pset_hash'])
             ## Convention for output dataset name:
             ## /<primarydataset>/<username>-<output_dataset_tag>-<PSETHASH>/USER
-            if file_info['filetype'] == 'EDM':
+            if file_info['filetype'] in ['EDM','DQM']:
                 if multiple_edm and file_info.get('module_label'):
                     left, right = publishname.rsplit('-', 1)
                     publishname = "%s_%s-%s" % (left, file_info['module_label'], right)
@@ -2414,6 +2473,8 @@ class PostJob():
             except IOError:
                 msg = "Error writing the output_datasets file"
                 self.logger.error(msg)
+        else:
+            self.logger.debug("Output datasets considered for upload:\n%s", output_datasets)
 
     ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
@@ -2454,6 +2515,9 @@ class PostJob():
             self.transfer_outputs = 1
         else:
             self.transfer_outputs = int(self.job_ad['CRAB_TransferOutputs'])
+        if self.stage == 'probe':
+            self.transfer_logs = 0
+            self.transfer_outputs = 0
         ## If self.job_ad['CRAB_ASOTimeout'] = 0, will use default timeout logic.
         if 'CRAB_ASOTimeout' in self.job_ad and int(self.job_ad['CRAB_ASOTimeout']) > 0:
             self.retry_timeout = int(self.job_ad['CRAB_ASOTimeout'])
@@ -2592,6 +2656,9 @@ class PostJob():
                     file_info['filetype'] = 'EDM'
                 elif output_file_info.get(u'Source', '') == u'TFileService':
                     file_info['filetype'] = 'TFILE'
+                elif (output_file_info.get(u'output_module_class', '') == u'DQMRootOutputModule' or \
+                      output_file_info.get(u'ouput_module_class',  '') == u'DQMRootOutputModule'):
+                    file_info['filetype'] = 'DQM'
                 else:
                     file_info['filetype'] = 'FAKE'
                 file_info['module_label'] = output_file_info.get(u'module_label', 'unknown')
@@ -2669,23 +2736,47 @@ class PostJob():
         """
         Update PostJobStatus and job exit-code among the job ClassAds for the monitoring script to update the Grafana dashboard.
         """
+        if not os.path.exists('/etc/editClassAds'):
+            self.logger.info("====== Will not edit the job ClassAd.")
+            return
+
         if os.environ.get('TEST_POSTJOB_NO_STATUS_UPDATE', False):
             self.schedd.edit([self.dag_jobid], "LeaveJobInQueue", classad.ExprTree("false"))
             return
-        self.logger.info("====== Starting to update classAds.")
+        self.logger.info("====== Starting to update job ClassAd.")
         msg = "status: %s." % (state)
         params = {'CRAB_PostJobStatus': '"{0}"'.format(state)}
         self.monitoringExitCode(params, exitCode)
-        msg += " ClassAds values to set are: %s" % (str(params))
+        msg += " ClassAd attributes to set are: %s" % (str(params))
         self.logger.info(msg)
-        with HTCondorUtils.AuthenticatedSubprocess(os.environ['X509_USER_PROXY'], logger=self.logger) as (parent, rpipe):
-            if not parent:
-                for param in params:
-                    self.schedd.edit([self.dag_jobid], param, str(params[param]))
-                self.schedd.edit([self.dag_jobid], 'CRAB_PostJobLastUpdate', str(time.time()))
-                # Once state classAds have been updated, let HTCondor remove the job from the queue
-                self.schedd.edit([self.dag_jobid], "LeaveJobInQueue", classad.ExprTree("false"))
-                self.logger.info("====== Finished to update classAds.")
+
+        limit = 5
+        counter = 0
+        while counter < limit:
+            try:
+                counter += 1
+                msg = "attempt %d out of %d" % (counter, limit)
+                self.logger.info("       -----> Started %s -----", msg)
+                with self.schedd.transaction(htcondor.TransactionFlags.NonDurable):
+                    if os.path.exists('/etc/editPostJobClassAdAttributes'):
+                        for param in params:
+                            self.schedd.edit([self.dag_jobid], param, str(params[param]))
+                        self.schedd.edit([self.dag_jobid], 'CRAB_PostJobLastUpdate', str(time.time()))
+                    # Once ClassAd state attributes have been updated, let HTCondor remove the job from the queue
+                    self.schedd.edit([self.dag_jobid], "LeaveJobInQueue", classad.ExprTree("false"))
+                    self.logger.info("       -----> Finished %s -----", msg)
+                    self.logger.info("====== Finished to update job ClassAd.")
+                    break
+            except Exception:
+                self.logger.exception("Exception in setting job ClassAd attributes:")
+
+            if counter != limit:
+                self.logger.warning("       -----> Failed to set job ClassAd attributes -----")
+                maxSleep = 2*counter -1
+                self.logger.warning("Sleeping for %d minute at most...", maxSleep)
+                time.sleep(60 * random.randint(2*(counter/3), maxSleep+1))
+            else:
+                self.logger.error("Failed to set job ClassAd attributes for %d times, will not retry. Dashboard may report stale job status/exit-code.", limit)
 
     ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
@@ -2842,7 +2933,12 @@ class PostJob():
     ## = = = = = PostJob = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
     def processWMArchive(self, retval):
-        WMARCHIVE_BASE_LOCATION = json.load(open("/etc/wmarchive.json")).get("BASE_DIR", "/data/wmarchive")
+        try:
+            with open("/etc/wmarchive.json") as wma:
+                WMARCHIVE_BASE_LOCATION = json.load(wma).get("BASE_DIR", "/data/wmarchive")
+        except:
+            self.logger.exception("Can not load the WM archive json. Exception follows:")
+            return
         WMARCHIVE_BASE_LOCATION = os.path.join(WMARCHIVE_BASE_LOCATION, 'new')
 
         now = int(time.time())
@@ -2858,7 +2954,7 @@ class PostJob():
             archiveDoc = createArchiverDoc(job)
             archiveDoc['task'] = self.reqname
             archiveDoc["meta_data"]['crab_id'] = self.job_id
-            archiveDoc["meta_data"]['crab_exit_code'] = self.job_report['exitCode']
+            archiveDoc["meta_data"]['crab_exit_code'] = self.job_report.get('exitCode', -1)
             archiveDoc["steps"].append(
                 {
                     "errors": [

@@ -157,18 +157,15 @@ class PreJob:
                   'SyncGridJobId': 'https://glidein.cern.ch/%s/%s' % (self.job_id, self.task_ad['CRAB_ReqName'].replace("_", ":")),
                  }
 
-        storage_rules = htcondor.param['CRAB_StorageRules']
+        if not self.userWebDirPrx:
+            storage_rules = htcondor.param['CRAB_StorageRules']
+            self.userWebDirPrx = getWebdirForDb(str(self.task_ad.get('CRAB_ReqName')), storage_rules)
 
-        self.logger.info("User web dir proxy: %s", self.userWebDirPrx)
-        userWebDir = getWebdirForDb(str(self.task_ad.get('CRAB_ReqName')), storage_rules)
-        self.logger.info("web dir: %s", userWebDir)
-
+        self.logger.info("User web dir: %s", self.userWebDirPrx)
         if self.userWebDirPrx:
             setDashboardLogs(params, self.userWebDirPrx, self.job_id, crab_retry)
-        elif userWebDir:
-            setDashboardLogs(params, userWebDir, self.job_id, crab_retry)
         else:
-            print("Not setting dashboard logfiles as I cannot find CRAB_UserWebDir nor CRAB_UserWebDirPrx.")
+            print("Not setting dashboard logfiles as I cannot find a web dir.")
 
         insertJobIdSid(params, self.job_id, self.task_ad['CRAB_ReqName'], crab_retry)
         apmon = ApmonIf()
@@ -184,7 +181,7 @@ class PreJob:
         self.task_ad = {}
         try:
             self.logger.info("Loading classads from: %s", os.environ['_CONDOR_JOB_AD'])
-            self.task_ad = classad.parseOld(open(os.environ['_CONDOR_JOB_AD']))
+            self.task_ad = classad.parseOne(open(os.environ['_CONDOR_JOB_AD']))
             self.logger.info(str(self.task_ad))
         except:
             msg = "Got exception while trying to parse the job ad."
@@ -433,7 +430,7 @@ class PreJob:
             datasites = set(site_info['group_datasites'][str(group)])
         else:
             with open("site.ad") as fd:
-                site_ad = classad.parse(fd)
+                site_ad = classad.parseOne(fd)
             available = set(site_ad['Job%s' % (self.job_id)])
         ## Take the intersection between the available sites and the site whitelist.
         ## This is the new set of available sites.
@@ -555,11 +552,10 @@ class PreJob:
         self.get_task_ad()
 
         try:
-            with open('proxied_webdir') as fd:
-                proxied_webdir = fd.read()
-            self.userWebDirPrx = proxied_webdir
+            with open('webdir') as fd:
+                self.userWebDirPrx = fd.read()
         except IOError as e:
-            self.logger.error("'I/O error(%s): %s', when looking for the proxied_webdir file. Might be normal"
+            self.logger.error("'I/O error(%s): %s', when looking for the 'webdir' file. Might be normal"
                               " if the schedd does not have a proxiedurl in the REST external config.", e.errno, e.strerror)
 
         try:
@@ -585,4 +581,3 @@ class PreJob:
         self.logger.info(msg)
         os.close(fd_prejob_log)
         os.execv("/bin/sleep", ["sleep", str(sleep_time)])
-
