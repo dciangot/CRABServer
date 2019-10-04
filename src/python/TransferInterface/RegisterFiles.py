@@ -34,7 +34,8 @@ def submit(trans_tuple, job_data, log, direct=False):
     try:
         phedex = PhEDEx(responseType='xml',
                         httpDict={'key': proxy,
-                                  'cert': proxy})
+                                  'cert': proxy,
+                                  'pycurl': True})
     except Exception:
         log.exception('PhEDEx exception.')
         return
