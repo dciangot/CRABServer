@@ -71,7 +71,7 @@ def perform_transfers(inputFile, lastLine, direct=False):
     taskname = None
     destination = None
 
-    with open(inputfile) as _list:
+    with open(inputFile) as _list:
         doc = json.loads(_list.readlines()[0])
         user = doc['username']
         taskname = doc['taskname']
