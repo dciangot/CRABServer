@@ -84,7 +84,7 @@ def monitor(user, taskname, log):
 
     # get replica locks and monitor status
     try:
-        locks_generator = crabInj.cli.examine_replication_locks(rules['id'])
+        locks_generator = crabInj.cli.list_replica_locks(rules['id'])
     except Exception:
         if rules['state'] == 'STUCK':
             transfers = crabInj.cli.examine_replication_rule(rules['id'])['transfers']

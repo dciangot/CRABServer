@@ -90,10 +90,11 @@ def submit(trans_tuple, job_data, log, direct=False):
         # saving file sizes and checksums
         filesizes = [x[columns.index('filesize')] for x in toTrans if x[columns.index('source')] == source]
         checksums = [x[columns.index('checksums')] for x in toTrans if x[columns.index('source')] == source]
+        pubnames = [x[columns.index('publishname')] for x in toTrans if x[columns.index('source')] == source]
 
         # ordered list of replicas information
-        jobs = zip(source_pfns, dest_lfns, ids, checksums, filesizes)
-        job_columns = ['source_pfns', 'dest_lfns', 'ids', 'checksums', 'filesizes']
+        jobs = zip(source_pfns, dest_lfns, ids, checksums, filesizes, pubnames)
+        job_columns = ['source_pfns', 'dest_lfns', 'ids', 'checksums', 'filesizes', 'pubnames']
 
         # ordered list of transfers details
         tx_from_source = [[job, source, taskname, user, destination] for job in jobs]
@@ -171,7 +172,7 @@ class submit_thread(threading.Thread):
         self.toUpdate = toUpdate
 
         # N.B: Replace ":" in taskname as not accepted by Rucio
-        self.taskname = self.files[0][self.file_col.index('taskname')].replace(":", "_")
+        self.taskname = self.job[0][self.job_col.index('pubnames')]
         self.username = self.files[0][self.file_col.index('user')]
         self.destination = self.files[0][self.file_col.index('destination')]
         self.scope = 'user.' + self.username
@@ -224,9 +225,7 @@ class submit_thread(threading.Thread):
             self.log.info(source_pfns)
 
             sizes = [x[self.job_col.index('filesizes')] for x in self.job if x[self.job_col.index('dest_lfns')] not in direct_files]
-
-            # TODO: actual checksum format not accepted by RUCIO
-            # checksums = [x[7] for x in self.files]
+            checksums = [x[self.job_col.index('checksums')] for x in self.job if x[self.job_col.index('dest_lfns')] not in direct_files]
 
             if self.direct:
                 try:
@@ -246,8 +245,8 @@ class submit_thread(threading.Thread):
                     return
 
             self.log.info("Registering temp file")
-            # crabInj.register_temp_replicas(self.source+"_Temp", dest_lfns, source_pfns, sizes, checksums)
-            crabInj.register_temp_replicas(self.source+"_Temp", dest_lfns, source_pfns, sizes, None)
+            crabInj.register_temp_replicas(self.source+"_Temp", dest_lfns, source_pfns, sizes, checksums)
+            #crabInj.register_temp_replicas(self.source+"_Temp", dest_lfns, source_pfns, sizes, None)
             crabInj.attach_files(dest_lfns, self.taskname)
 
         except Exception:

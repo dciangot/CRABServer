@@ -63,14 +63,15 @@ def perform_transfers(inputFile, lastLine, direct=False):
                          "source",
                          "destination",
                          "checksums",
-                         "filesize"
+                         "filesize",
+                         "publishname"
                          ]
     transfers = []
     user = None
     taskname = None
     destination = None
 
-    with open(inputFile) as _list:
+    with open(inputfile) as _list:
         doc = json.loads(_list.readlines()[0])
         user = doc['username']
         taskname = doc['taskname']
@@ -218,7 +219,10 @@ def algorithm():
         logging.info('Nothing to monitor yet.')
         return
     try:
-        monitor_manager(user, taskname)
+        with open("task_process/transfers.txt") as _list:
+            doc = json.loads(_list.readlines()[0])
+            publishname = doc['publishname']
+        monitor_manager(user, publishname)
     except Exception:
         logging.exception('Monitor proccess failed.')
 

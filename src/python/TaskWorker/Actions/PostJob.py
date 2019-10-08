@@ -807,7 +807,6 @@ class ASOServerJob(object):
                           'username': doc['user'],
                           'taskname': doc['workflow'],
                           'start_time': self.aso_start_timestamp,
-                          'publishname': self.publishname,
                           'destination': doc['destination'],
                           'destination_lfn': doc['destination_lfn'],
                           'source': doc['source'],
@@ -834,7 +833,6 @@ class ASOServerJob(object):
                           'username': doc['username'],
                           'taskname': doc['taskname'],
                           'start_time': self.aso_start_timestamp,
-                          'publishname': self.publishname,
                           'source': doc['source'],
                           'source_lfn': doc['source_lfn'],
                           'filesize': doc['filesize'],
@@ -853,6 +851,8 @@ class ASOServerJob(object):
                     msg += "\n%s" % (str(hte.headers))
                     returnMsg['error'] = msg
             if toTransfer:
+                if not 'publishname' in newDoc:
+                    newDoc['publishname'] =  self.publishname
                 if not 'checksums' in newDoc:
                     newDoc['checksums'] = doc['checksums']
                 if not 'destination_lfn' in newDoc:
@@ -867,6 +867,8 @@ class ASOServerJob(object):
                         rest_file.write(self.rest_host + self.rest_uri_no_api + '\n')
                         rest_file.write(self.proxy)
             else:
+                if not 'publishname' in newDoc:
+                    newDoc['publishname'] =  self.publishname
                 if not 'checksums' in newDoc:
                     newDoc['checksums'] = doc['checksums']
                 if not 'destination_lfn' in newDoc:
