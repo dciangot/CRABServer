@@ -383,7 +383,7 @@ def submit(phedex, ftsContext, toTrans):
         source_pfns = sorted_source_pfns
         dest_pfns = sorted_dest_pfns
 
-        tx_from_source = [[x[0], x[1], x[2], source, username, taskname, x[3]] for x in zip(source_pfns, dest_pfns, ids, sizes, checksums)]
+        tx_from_source = [[x[0], x[1], x[2], source, username, taskname, x[3], x[4]['adler32'].rjust(8,'0')] for x in zip(source_pfns, dest_pfns, ids, sizes, checksums)]
 
         for files in chunks(tx_from_source, 200):
             thread = submit_thread(threadLock, logging, ftsContext, files, source, jobids, to_update)
