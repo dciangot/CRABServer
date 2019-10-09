@@ -89,7 +89,7 @@ def perform_transfers(inputFile, lastLine, direct=False):
                 if column not in ['checksums']:
                     file_to_submit.append(doc[column])
                 if column == "checksums":
-                    file_to_submit.append(doc["checksums"]["adler32"])
+                    file_to_submit.append(doc["checksums"]["adler32"].rjust(8,'0'))
             transfers.append(file_to_submit)
             destination = doc["destination"]
 
