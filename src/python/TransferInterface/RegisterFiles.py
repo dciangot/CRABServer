@@ -22,9 +22,8 @@ def submit(trans_tuple, job_data, log, direct=False):
     threadLock = threading.Lock()
     threads = []
     to_update = []
-
-    toTrans = trans_tuple[0]
-    columns = trans_tuple[1]
+    
+    toTrans = trans_tuple
     proxy = job_data['proxy']
     rest_filetransfers = job_data['rest']
     user = job_data['username']
@@ -41,7 +40,8 @@ def submit(trans_tuple, job_data, log, direct=False):
         return
 
     # Split threads by source RSEs
-    sources = list(set([x[columns.index('source')] for x in toTrans]))
+    sources = set([x['source'] for x in toTrans])
+    #list(set([x[columns.index('source')] for x in toTrans]))
 
     os.environ["X509_CERT_DIR"] = os.getcwd()
     log.info("Connection to %s with proxy in:\n %s" % (rest_filetransfers,proxy))
@@ -52,16 +52,16 @@ def submit(trans_tuple, job_data, log, direct=False):
 
     # mapping lfn <--> pfn
     for source in sources:
-
-        ids = [x[columns.index('id')] for x in toTrans if x[columns.index('source')] == source]
-        src_lfns = [x[columns.index('source_lfn')] for x in toTrans if x[columns.index('source')] == source]
-        dst_lfns = [x[columns.index('destination_lfn')] for x in toTrans if x[columns.index('source')] == source]
+        ids = [ x["id"] for x in toTrans if x['source'] == source ]
+        src_lfns = [x['source_lfn'] for x in toTrans if x['source'] == source]
+        dst_lfns = [x['destination_lfn'] for x in toTrans if x['source'] == source]
 
         sorted_source_pfns = []
         sorted_dest_lfns = []
         sorted_dest_pfns = []
 
         # workaround for phedex.getPFN issue --> shuffling output order w.r.t. the list in input
+        # split files to be transferred from a common source into chucks of 10 files and than ask phedex for lfn2pfn
         try:
             for chunk in chunks(src_lfns, 10):
                 unsorted_source_pfns = [[k[1], str(x)] for k, x in phedex.getPFN(source, chunk).items()]
@@ -88,44 +88,52 @@ def submit(trans_tuple, job_data, log, direct=False):
         dest_lfns = sorted_dest_lfns
 
         # saving file sizes and checksums
-        filesizes = [x[columns.index('filesize')] for x in toTrans if x[columns.index('source')] == source]
-        checksums = [x[columns.index('checksums')] for x in toTrans if x[columns.index('source')] == source]
-        pubnames = [x[columns.index('publishname')] for x in toTrans if x[columns.index('source')] == source]
+        filesizes = [x['filesize'] for x in toTrans if x['source'] == source]
+        checksums = [x['checksums'] for x in toTrans if x['source'] == source]
+        pubnames = [x['publishname'] for x in toTrans if x['source'] == source]
 
         # ordered list of replicas information
-        jobs = zip(source_pfns, dest_lfns, ids, checksums, filesizes, pubnames)
-        job_columns = ['source_pfns', 'dest_lfns', 'ids', 'checksums', 'filesizes', 'pubnames']
+        #jobs = zip(source_pfns, dest_lfns, ids, checksums, filesizes, pubnames)
+
+        jobs = {
+            "source_pfns": source_pfns,
+            "dest_lfns": dest_lfns,
+            "ids": ids,
+            "checksum": checksums,
+            "filesizes": filesizes,
+            "pubnames": pubnames,
+            "destination": destination,
+            "source": source,
+            "taskname": taskname,
+            "user": user
+        }
+
+        #job_columns = ['source_pfns', 'dest_lfns', 'ids', 'checksums', 'filesizes', 'pubnames']
 
         # ordered list of transfers details
-        tx_from_source = [[job, source, taskname, user, destination] for job in jobs]
-        tx_columns = ['job', 'source', 'taskname', 'user', 'destination']
+        #tx_from_source = [[job, source, taskname, user, destination] for job in jobs]
+        #tx_columns = ['job', 'source', 'taskname', 'user', 'destination']
 
         # split submission process in chunks of max 200 files
-        for files in chunks(tx_from_source, 200):
-            if not direct:
-                log.info("Submitting: %s", files)
-                thread = submit_thread(threadLock,
-                                       log,
-                                       (files, tx_columns),
-                                       job_columns,
-                                       proxy,
-                                       to_update)
-                thread.start()
-                threads.append(thread)
-            elif direct:
-                log.info("Registering direct stageout: %s", files)
-                thread = submit_thread(threadLock,
-                                       log,
-                                       (files, tx_columns),
-                                       job_columns,
-                                       proxy,
-                                       to_update,
-                                       direct=True)
-                thread.start()
-                threads.append(thread)
-
-    for t in threads:
-        t.join()
+        #for files in chunks(tx_from_source, 200):
+        #    if not direct:
+        log.info("Submitting %s jobs", len(jobs["ids"]))
+        if not direct:
+        submit_thread( 
+            log,
+            jobs,
+            proxy,
+            to_update
+        )
+        elif direct:
+            log.info("Registering direct stageout: %s", files)
+            submit_thread(
+                log,
+                jobs,
+                proxy,
+                to_update,
+                direct=True
+            )
 
     if len(to_update) == 0:
         return False
@@ -145,68 +153,34 @@ class submit_thread(threading.Thread):
     """
 
     """
-    def __init__(self, threadLock, log, files, job_column, proxy, toUpdate, direct=False):
-        """Rucio submit thread class
+    def __init__(self, threadLock, log, files, proxy, toUpdate, direct=False):
 
-        :param threadLock: thread lock
-        :type threadLock: threadLock
-        :param log: log object
-        :type log: logging
-        :param files: tuple of: list of files info and corresponding column name list (files, column_name)
-        :type files: tuple
-        :param job_column: list of column name for job ordered list
-        :type job_column: list
-        :param proxy: path to user proxy
-        :type proxy: str
-        :param toUpdate: list of file with status update required on oracleDB 
-        :type toUpdate: list
-        :param direct: job output stored on temp or directly, defaults to False
-        :param direct: bool, optional
-        """
-        threading.Thread.__init__(self)
-        self.log = log
-        self.direct = direct
-        self.proxy = proxy
-        self.threadLock = threadLock
-        self.files = files[0]
-        self.file_col = files[1]
-        self.job = [x[0] for x in self.files]
-        self.job_col = job_column
-        self.source = self.files[0][self.file_col.index('source')]
-        self.toUpdate = toUpdate
+    def submit_job(log,files,proxy,toUpdate,direct=False):
 
-        # N.B: Replace ":" in taskname as not accepted by Rucio
-        self.taskname = self.job[0][self.job_col.index('pubnames')]
-        self.username = self.files[0][self.file_col.index('user')]
-        self.destination = self.files[0][self.file_col.index('destination')]
-        self.scope = 'user.' + self.username
+        log.info("Submitting %s transfers to Rucio server" % len(files["ids"]))
 
-    def run(self):
-
-        self.threadLock.acquire()
-        self.log.info("Processing transfers from: %s" % self.source)
-
-        self.log.info("Submitting %s transfers to Rucio server" % len(self.files))
+        taskname = files['taskname']
+        scope = 'user.' + files['username']
 
         try:
-            os.environ["X509_USER_PROXY"] = self.proxy
-            self.log.info("Initializing Rucio client for %s", self.taskname)
-            crabInj = CRABDataInjector(self.taskname,
-                                       self.destination,
-                                       account=self.username,
-                                       scope=self.scope,
+            os.environ["X509_USER_PROXY"] = proxy
+            log.info("Initializing Rucio client for %s", taskname)
+            crabInj = CRABDataInjector(taskname,
+                                       files['destination'],
+                                       account= files['username'],
+                                       scope=scope,
                                        auth_type='x509_proxy')
 
             # Check if the corresponding dataset is already present in RUCIO
             # In case is missing try to create it with the corresponding rule
             self.log.info("Checking for current dataset")
-            crabInj.cli.get_did(self.scope, self.taskname)
+            crabInj.cli.get_did(scope, taskname)
         except Exception as ex:
-            self.log.warn("Failed to find dataset %s:%s On Rucio server: %s", "user.%s" % self.username, self.taskname, ex)
+            self.log.warn("Failed to find dataset %s:%s On Rucio server: %s", "user.%s" % username, taskname, ex)
             try:
                 crabInj.add_dataset()
             except Exception as ex:
-                self.log.error("Failed to create dataset %s:%s on Rucio server: %s", "user.%s" % self.taskname, self.taskname, ex)
+                self.log.error("Failed to create dataset %s:%s on Rucio server: %s", "user.%s" % taskname, taskname, ex)
                 self.threadLock.release()
                 return
 
@@ -217,25 +191,28 @@ class submit_thread(threading.Thread):
                 with open("task_process/transfers/registered_direct_files.txt", "r") as list_file:
                     direct_files = [x.split('\n')[0] for x in list_file.readlines()]
             
-            # get needed information from ordered list. Discarding direct staged files
-            # TODO: since we are splitting threads in chunks 
-            #       we may consider to use dict instead of lists.
-            self.log.debug(self.job_col)
-            dest_lfns = [x[self.job_col.index('dest_lfns')] for x in self.job if x[self.job_col.index('dest_lfns')] not in direct_files]
-            source_pfns = [x[self.job_col.index('source_pfns')] for x in self.job if x[self.job_col.index('dest_lfns')] not in direct_files]
+            # get needed information from file dict. Discarding direct staged files
+            dest_lfns = []
+            source_pfns = []
+            sizes = []
+            checksums = []
 
-            self.log.info(self.source+"_Temp")
-            self.log.info(dest_lfns)
-            self.log.info(source_pfns)
+            for index, lfn in files["dest_lfns"].enumerate():
+                if lfn not in direct_files:
+                    dest_lfns.append(lfn)
+                    source_pfns.append(f["source_pfns"][index])
+                    sizes.append(f["filesizes"][index])
+                    checksums.append(f["checksums"][index])
 
-            sizes = [x[self.job_col.index('filesizes')] for x in self.job if x[self.job_col.index('dest_lfns')] not in direct_files]
-            checksums = [x[self.job_col.index('checksums')] for x in self.job if x[self.job_col.index('dest_lfns')] not in direct_files]
+            log.info(files["source"]+"_Temp")
+            log.info(dest_lfns)
+            log.info(source_pfns)
 
-            if self.direct:
+            if direct:
                 try:
-                    self.log.info("Registering direct files")
-                    crabInj.register_crab_replicas(self.destination, dest_lfns, sizes, None)
-                    crabInj.attach_files(dest_lfns, self.taskname)
+                    log.info("Registering direct files")
+                    crabInj.register_crab_replicas(files['destination'], dest_lfns, sizes, None)
+                    crabInj.attach_files(dest_lfns, taskname)
                     with open("task_process/transfers/registered_direct_files.txt", "a+") as list_file:
                         for dest_lfn in dest_lfns:
                             list_file.write("%s\n" % dest_lfn)
@@ -248,10 +225,11 @@ class submit_thread(threading.Thread):
                     self.threadLock.release()
                     return
 
+            # Eventullay registering files in Rucio Temp RSE
             self.log.info("Registering temp file")
-            crabInj.register_temp_replicas(self.source+"_Temp", dest_lfns, source_pfns, sizes, checksums)
+            crabInj.register_temp_replicas(files["source"]+"_Temp", dest_lfns, source_pfns, sizes, checksums)
             #crabInj.register_temp_replicas(self.source+"_Temp", dest_lfns, source_pfns, sizes, None)
-            crabInj.attach_files(dest_lfns, self.taskname)
+            crabInj.attach_files(dest_lfns, taskname)
 
         except Exception:
             self.log.exception("Failed to register replicas")
@@ -263,7 +241,7 @@ class submit_thread(threading.Thread):
             fileDoc = dict()
             fileDoc['asoworker'] = 'rucio'
             fileDoc['subresource'] = 'updateTransfers'
-            fileDoc['list_of_ids'] = [x[self.job_col.index('ids')] for x in self.job]
+            fileDoc['list_of_ids'] = [x['ids'] for x in self.files]
             fileDoc['list_of_transfer_state'] = ["SUBMITTED" for _ in self.files]
             fileDoc['list_of_fts_instance'] = ['https://fts3.cern.ch:8446/' for _ in self.job]
             fileDoc['list_of_fts_id'] = ['NA' for _ in self.job]
@@ -272,7 +250,4 @@ class submit_thread(threading.Thread):
             self.toUpdate.append(fileDoc)
         except Exception:
             self.log.exception("Failed to update status in oracle")
-            self.threadLock.release()
             return
-
-        self.threadLock.release()

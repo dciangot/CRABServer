@@ -1,6 +1,8 @@
 #!/usr/bin/python
 """
 
+
+
 """
 from __future__ import absolute_import, division, print_function
 import json
@@ -23,7 +25,6 @@ logging.basicConfig(
 USER = None
 TASKNAME = None
 
-
 def perform_transfers(inputFile, lastLine, direct=False):
     """
     get transfers submitted and update last read line number
@@ -41,7 +42,7 @@ def perform_transfers(inputFile, lastLine, direct=False):
     if not os.path.exists(inputFile):
         return None, None
 
-    # Get proxy and rest endpoint information
+    # Get proxy and rest endpoint information posted by the postjob
     proxy = None
     if os.path.exists('task_process/rest_filetransfers.txt'):
         with open("task_process/rest_filetransfers.txt", "r") as _rest:
@@ -56,17 +57,6 @@ def perform_transfers(inputFile, lastLine, direct=False):
 
     logging.info("starting from line: %s" % lastLine)
 
-    file_to_submit = []
-    to_submit_columns = ["source_lfn",
-                         "destination_lfn",
-                         "id",
-                         "source",
-                         "destination",
-                         "checksums",
-                         "filesize",
-                         "publishname"
-                         ]
-    transfers = []
     user = None
     taskname = None
     destination = None
@@ -76,24 +66,30 @@ def perform_transfers(inputFile, lastLine, direct=False):
         user = doc['username']
         taskname = doc['taskname']
 
-    # Save needed info in ordered lists
-    with open(inputFile) as _list:
-        for _data in _list.readlines()[lastLine:]:
-            file_to_submit = []
-            try:
-                lastLine += 1
-                doc = json.loads(_data)
-            except Exception:
-                continue
-            for column in to_submit_columns:
-                if column not in ['checksums', 'publishname']:
-                    file_to_submit.append(doc[column])
-                if column == "publishname":
-                    file_to_submit.append(doc["publishname"].replace('-00000000000000000000000000000000', '/rucio/USER'))
-                if column == "checksums":
-                    file_to_submit.append(doc["checksums"]["adler32"].rjust(8,'0'))
-            transfers.append(file_to_submit)
-            destination = doc["destination"]
+    transfers = doc
+
+    # # Save needed info in ordered lists
+    # with open(inputFile) as _list:
+    #     for _data in _list.readlines()[lastLine:]:
+    #         file_to_submit = []
+    #         try:
+    #             lastLine += 1
+    #             doc = json.loads(_data)
+    #         except Exception:
+    #             continue
+    #         for column in to_submit_columns:
+    #             if column not in ['checksums', 'publishname']:
+    #                 file_to_submit.append(doc[column])
+    #             if column == "publishname":
+    #                 file_to_submit.append(doc["publishname"].replace('-00000000000000000000000000000000', '/rucio/USER'))
+    #             if column == "checksums":
+    #                 file_to_submit.append(doc["checksums"]["adler32"].rjust(8,'0'))
+    #         transfers.append(file_to_submit)
+    #         destination = doc["destination"]
+
+    transfers["publishname"] = doc["publishname"].replace('-00000000000000000000000000000000', '/rucio/USER')
+    transfers["checksums"] = doc["checksums"]["adler32"].rjust(8,'0')
+
 
 
     # Pass collected info to submit function
@@ -106,7 +102,7 @@ def perform_transfers(inputFile, lastLine, direct=False):
                     'rest': rest_filetransfers}
         if not direct:
             try:
-                success = submit((transfers, to_submit_columns), job_data, logging)
+                success = submit(transfers, job_data, logging)
                 # TODO: send to dashboard
             except Exception:
                 logging.exception('Submission process failed.')
@@ -119,7 +115,7 @@ def perform_transfers(inputFile, lastLine, direct=False):
 
         elif direct:
             try:
-                success = submit((transfers, to_submit_columns), job_data, logging, direct=True)
+                success = submit(transfers, job_data, logging, direct=True)
             except Exception:
                 logging.exception('Registering direct stage files failed.')
 
