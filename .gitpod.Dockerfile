@@ -11,13 +11,12 @@ FROM gitpod/workspace-full
 #  - rucio
 RUN wget https://github.com/dmwm/WMCore/archive/1.3.6.crab5.tar.gz && \
     tar -xzvf 1.3.6.crab5.tar.gz && \
-    ls -altrh && pwd && \
-    mv WMCore-1.3.6.crab5 /workspace/WMCore
+    mv WMCore-1.3.6.crab5 /home/gitpod/WMCore
 
 RUN wget https://gitlab.cern.ch/fts/fts-rest/-/archive/v3.9.4/fts-rest-v3.9.4.tar.gz && \
     tar -xzvf fts-rest-v3.9.4.tar.gz && \
-    mv fts-rest-v3.9.4 /workspace/fts3-rest
+    mv fts-rest-v3.9.4 /home/gitpod/fts3-rest
 
 RUN pip install rucio-clients
 
-ENV PYTHONPATH=$PYTHONPATH:/workspace/WMCore/src/python:/workspace/fts3-rest/src
+ENV PYTHONPATH=$PYTHONPATH:/home/gitpod/WMCore/src/python:/home/gitpod/fts3-rest/src
