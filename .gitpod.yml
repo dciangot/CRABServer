@@ -1,4 +1,2 @@
 image:
   file: .gitpod.Dockerfile
-tasks:
-  - init: ~/.pyenv/bin/pyenv init && export PYTHONPATH=$PYTHONPATH:/workspace/CRABServer/src/python:/home/gitpod/WMCore/src/python:/home/gitpod/fts3-rest/src

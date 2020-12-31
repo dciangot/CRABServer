@@ -19,4 +19,5 @@ RUN wget https://gitlab.cern.ch/fts/fts-rest/-/archive/v3.9.4/fts-rest-v3.9.4.ta
 
 RUN pip install rucio-clients
 
-ENV PYTHONPATH=$PYTHONPATH:/home/gitpod/WMCore/src/python:/home/gitpod/fts3-rest/src
+RUN echo "/home/gitpod/WMCore/src/python" > /home/gitpod/.pyenv/versions/3.8.6/lib/python3.8/site-packages/WMCore.pth
+RUN echo "/home/gitpod/fts3-rest/src" > /home/gitpod/.pyenv/versions/3.8.6/lib/python3.8/site-packages/FTS3.pth
