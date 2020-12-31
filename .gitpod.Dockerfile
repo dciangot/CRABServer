@@ -11,6 +11,7 @@ FROM gitpod/workspace-full
 #  - rucio
 RUN wget https://github.com/dmwm/WMCore/archive/1.3.6.crab5.tar.gz && \
     tar -xzvf 1.3.6.crab5.tar.gz && \
+    ls -altrh && pwd && \
     mv WMCore-1.3.6.crab5 /workspace/WMCore
 
 RUN wget https://gitlab.cern.ch/fts/fts-rest/-/archive/v3.9.4/fts-rest-v3.9.4.tar.gz && \
